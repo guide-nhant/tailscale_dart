@@ -96,6 +96,21 @@ abstract class Udp {
   /// used. Pass [address] to bind a specific local tailnet IP. Pass `0` for
   /// [port] to request an ephemeral local UDP port.
   Future<TailscaleDatagramBinding> bind({required int port, String? address});
+
+  /// Binds a UDP datagram endpoint and returns the raw POSIX file
+  /// descriptor, bypassing the [TailscaleDatagramBinding] wrapper.
+  ///
+  /// Intended for integrations that must hand the fd to a non-Dart caller
+  /// (native FFI, third-party socket-owning libraries). Ownership of the fd
+  /// transfers to the caller — the runtime does not track, adopt, or close
+  /// it. See [TailscaleFdEndpoint] for the full contract.
+  ///
+  /// Payloads sent/received on the fd carry the v1 tailnet envelope
+  /// (4-byte header + payload) documented at the top of this file. Callers
+  /// that need a raw payload wire without envelope framing should use
+  /// [bind] and the wrapped [TailscaleDatagramBinding.send] / .datagrams
+  /// instead.
+  Future<TailscaleFdEndpoint> bindFd({required int port, String? address});
 }
 
 /// Library-internal factory. Reach via `Tailscale.instance.udp`.
@@ -141,6 +156,32 @@ final class _Udp implements Udp {
       if (e is TailscaleUdpException) rethrow;
       throw TailscaleUdpException(
         'udp.bind failed for $resolvedAddress:$port',
+        cause: e,
+      );
+    }
+  }
+
+  @override
+  Future<TailscaleFdEndpoint> bindFd({
+    required int port,
+    String? address,
+  }) async {
+    if (Platform.isWindows) {
+      throw const TailscaleUdpException('Windows is not supported.');
+    }
+    final resolvedAddress = address ?? await _defaultAddress();
+    if (resolvedAddress == null || resolvedAddress.isEmpty) {
+      throw const TailscaleUdpException(
+        'udp.bindFd requires a local tailnet address before this node has IPv4.',
+      );
+    }
+    try {
+      final (:fd, :local) = await _bind(resolvedAddress, port);
+      return TailscaleFdEndpoint(fd: fd, local: local);
+    } catch (e) {
+      if (e is TailscaleUdpException) rethrow;
+      throw TailscaleUdpException(
+        'udp.bindFd failed for $resolvedAddress:$port',
         cause: e,
       );
     }

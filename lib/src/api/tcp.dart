@@ -42,6 +42,22 @@ abstract class Tcp {
   /// [address] restricts the listener to a specific tailnet IP of this node;
   /// leave null to accept on all tailnet IPs this node holds.
   Future<TailscaleListener> bind({required int port, String? address});
+
+  /// Opens a TCP connection and returns the raw POSIX file descriptor,
+  /// bypassing the [TailscaleConnection] wrapper.
+  ///
+  /// Intended for integrations that must hand the fd to a non-Dart caller
+  /// (native FFI, third-party socket-owning libraries). Ownership of the fd
+  /// transfers to the caller — the runtime does not track, adopt, or close
+  /// it. See [TailscaleFdEndpoint] for the full contract.
+  ///
+  /// Throws [TailscaleTcpException] on tailnet-side failures (no route,
+  /// refused, node not running).
+  Future<TailscaleFdEndpoint> dialFd(
+    String host,
+    int port, {
+    Duration? timeout,
+  });
 }
 
 /// Library-internal factory. Reach via `Tailscale.instance.tcp`.
@@ -93,6 +109,27 @@ final class _Tcp implements Tcp {
       if (e is TailscaleException) rethrow;
       throw TailscaleTcpException(
         'tcp.bind failed for tailnet port $port',
+        cause: e,
+      );
+    }
+  }
+
+  @override
+  Future<TailscaleFdEndpoint> dialFd(
+    String host,
+    int port, {
+    Duration? timeout,
+  }) async {
+    if (Platform.isWindows) {
+      throw const TailscaleTcpException('Windows is not supported.');
+    }
+    try {
+      final (:fd, :local, :remote) = await _dial(host, port, timeout);
+      return TailscaleFdEndpoint(fd: fd, local: local, remote: remote);
+    } catch (e) {
+      if (e is TailscaleTcpException) rethrow;
+      throw TailscaleTcpException(
+        'tcp.dialFd failed for $host:$port',
         cause: e,
       );
     }

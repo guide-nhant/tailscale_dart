@@ -47,6 +47,51 @@ final class TailscaleEndpoint {
   String toString() => address.isEmpty ? ':$port' : '$address:$port';
 }
 
+/// Raw POSIX file descriptor for a tailnet transport, together with the
+/// endpoint metadata Go reported at bind/dial time.
+///
+/// Returned by [Tcp.dialFd] and [Udp.bindFd] for integrations that need to
+/// hand the fd to a non-Dart caller (native FFI, another socket-owning
+/// library). Ownership of the fd transfers to the caller — the runtime does
+/// not track it, does not close it, and does not adopt it into a
+/// [TailscaleConnection] / [TailscaleDatagramBinding] wrapper. The caller
+/// MUST `close(fd)` when done.
+///
+/// The fd carries WireGuard-tunneled traffic transparently: reads and
+/// writes flow over the tailnet to the remote endpoint just as they would
+/// with a native socket. It is safe to use with standard POSIX socket calls
+/// (`send`, `recv`, `poll`, `close`, `setsockopt`, ...). Windows is not
+/// supported today — matching the rest of the package.
+@immutable
+final class TailscaleFdEndpoint {
+  const TailscaleFdEndpoint({required this.fd, required this.local, this.remote});
+
+  /// POSIX file descriptor. Caller owns; must `close()` when done.
+  final int fd;
+
+  /// Local tailnet endpoint bound to this fd.
+  final TailscaleEndpoint local;
+
+  /// Remote tailnet endpoint (for TCP dial). Null for UDP bind — datagrams
+  /// carry per-packet remote endpoints in the wire envelope, not on the fd.
+  final TailscaleEndpoint? remote;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TailscaleFdEndpoint &&
+          fd == other.fd &&
+          local == other.local &&
+          remote == other.remote;
+
+  @override
+  int get hashCode => Object.hash(fd, local, remote);
+
+  @override
+  String toString() =>
+      'TailscaleFdEndpoint(fd: $fd, local: $local, remote: $remote)';
+}
+
 /// One full-duplex byte stream over the tailnet.
 abstract interface class TailscaleConnection {
   /// Local tailnet endpoint for this connection.
