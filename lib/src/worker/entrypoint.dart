@@ -70,19 +70,14 @@ void _workerEntrypoint(SendPort sendPort) {
               :stateDir,
             ) = request;
 
-            if (authKey.isEmpty) {
-              final stateDirPtr = stateDir.toNativeUtf8();
-              try {
-                if (native.duneHasState(stateDirPtr) == 0) {
-                  throw const TailscaleUpException(
-                    'No auth key provided and no existing session state. '
-                    'Pass an authKey to authenticate.',
-                  );
-                }
-              } finally {
-                calloc.free(stateDirPtr);
-              }
-            }
+            // Empty authKey with no persisted state used to throw here —
+            // that pre-empted Go tsnet's `StartLoginInteractive` flow,
+            // which produces a `needsLogin` state with a browsable
+            // `AuthURL`. LumeN's iPad client (US-081) surfaces that URL
+            // in Safari for interactive OAuth login. Let the Go worker
+            // decide: on a fresh state dir with no key, tsnet.Server
+            // registers a login and emits needsLogin via the IPN bus,
+            // which `up()` reports as a stable state below.
 
             // Allocate inside the try so any partial-allocation failure
             // (hypothetically OOM mid-sequence) still hits the finally and
