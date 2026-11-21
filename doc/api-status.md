@@ -6,14 +6,25 @@ purpose, and a copy-pasteable
 example. For the forward-looking phase plan, see
 [`api-roadmap.md`](api-roadmap.md).
 
-The **core public path** is lifecycle + private HTTP/TCP/UDP/TLS,
-Serve/Funnel forwarding, identity, diagnostics, prefs, and exit-node controls.
-Optional namespaces remain tracked here, but they do not block a useful release
-for embedded Dart apps.
+> **Architecture transition:** this file describes callable APIs in the current
+> source. R4d's persistent StateStore is one authenticated encrypted Go
+> envelope whose 32-byte DEK is held by Keybay; ephemeral nodes use an
+> in-memory StateStore and no Keybay. R5's automatic first-`Up` gate and
+> runtime-owned ServeConfig manager are also present. The [rearchitecture
+> plan](rearchitecture-plan.md) and its
+> [runtime](adr-runtime-ownership-and-lifecycle.md) and
+> [encrypted-state](adr-encrypted-node-state.md) ADRs also describe later work
+> and release evidence that has not all shipped. Encryption covers logical
+> StateStore data, not every upstream log, config, or TLS sidecar in the package
+> subtree.
+
+The **core mobile public path** is lifecycle + private HTTP/TCP/UDP, identity,
+diagnostics, prefs, and exit-node controls. Platform-qualified TLS and
+Serve/Funnel forwarding remain useful desktop/server surfaces. Unimplemented
+ideas are tracked separately in `api-roadmap.md`, not exported as placeholders.
 
 **Legend:**
 - ✅ Working — callable today, tested, returns real values.
-- ⛔ Stub — typed + documented, throws `UnimplementedError`.
 
 **Convention:** all examples assume `final tsnet = Tailscale.instance;`
 and that [`Tailscale.init`](#lifecycle-top-level) has already been called.
@@ -23,13 +34,29 @@ fd-backed data plane depends on native descriptors plus kqueue/epoll. Windows
 is intentionally unsupported until a Windows-native backend or fallback carrier
 is designed.
 
-**Implementation model:** this package aligns to both upstream
-`tsnet.Server` and upstream `local.Client`. Transport primitives such as
-HTTP, TCP, UDP, TLS, Funnel, and future service listeners follow
-`tsnet`; node introspection, diagnostics, prefs, profiles, serve
-config, exit nodes, and taildrop follow LocalAPI via `local.Client`.
+Persistent-node custody follows Keybay's narrower platform contract. Android
+requires Android 12 / API 31+. Linux requires desktop `secret-tool` plus an
+available, unlocked Secret Service; headless Linux has no supported persistent
+custody path. Older Android and headless Linux can use explicit ephemeral mode,
+which never accesses Keybay.
 
-**Version note:** the current repo pin is `tailscale.com v1.100.0`. Keep
+**Implementation model:** this package aligns to both upstream
+`tsnet.Server` and upstream `local.Client`. HTTP, TCP, UDP, and raw listeners
+use `tsnet`; implemented node introspection, diagnostics, prefs, Serve/Funnel
+configuration, exit-node controls, and certificate lookup use LocalAPI via the
+runtime's cached `local.Client`. Profiles and Taildrop remain roadmap topics and
+are not exported until implemented.
+
+**Mobile publication qualification:** the current upstream v1.102.2 pin
+compiles the LocalAPI certificate endpoint used by TLS termination as a 404
+stub on iOS and Android, so `tls.bind` rejects immediately on those platforms;
+the package does not add a parallel certificate path. R5 no longer uses
+`ListenFunnel`; Funnel is ServeConfig visibility on the
+shared handler. That path and HTTPS Serve remain unqualified on mobile until
+real-device handshakes and persistent-sidecar inventory pass. The private
+HTTP/TCP/UDP core remains the mobile support target.
+
+**Version note:** the current repo pin is `tailscale.com v1.102.2`. Keep
 upstream version skew visible when adding new wrappers.
 
 ## Namespace overview
@@ -39,16 +66,14 @@ upstream version skew visible when adding new wrappers.
 | [Lifecycle](#lifecycle-top-level) | Engine start/stop + node state snapshot + reactive streams | Core      | ✅        |
 | [`http`](#http)         | Outbound HTTP client + inbound request server                     | Core      | ✅        |
 | [`tcp`](#tcp)           | Raw TCP between tailnet nodes                                      | Core      | ✅        |
-| [`tls`](#tls)           | TLS-terminated listener with auto-provisioned cert                 | Advanced  | ✅             |
+| [`tls`](#tls)           | Certificate-domain discovery and TLS-terminated listener           | Advanced  | domains ✅; bind ✅ desktop/server, unsupported mobile |
 | [`udp`](#udp)           | UDP datagram bindings on a tailnet IP                               | Advanced  | ✅        |
-| [`funnel`](#funnel)     | Public-internet HTTPS forwarding via Tailscale Funnel              | Optional  | ✅               |
-| [`taildrop`](#taildrop) | Node-to-node file transfer                                          | Optional  | Planned          |
-| [`serve`](#serve)       | Tailnet publication for existing local HTTP services                | Optional  | ✅               |
+| [`funnel`](#funnel)     | Public-internet HTTPS forwarding via Tailscale Funnel              | Optional  | ✅ desktop/server; mobile unqualified |
+| [`serve`](#serve)       | Tailnet publication for existing local HTTP services                | Optional  | ✅ desktop/server HTTPS; mobile HTTPS unqualified |
 | [`services`](#tailscale-services) | Tailscale Services hosts via upstream `ListenService`       | Optional  | Planned          |
 | [`exitNode`](#exitnode) | Route outbound traffic through another node                                | Advanced  | ✅        |
-| [`profiles`](#profiles) | Multi-account / multi-tailnet                                        | Optional  | Planned          |
-| [`prefs`](#prefs)       | Subnet routes, shields, tags, auto-update                           | Advanced  | ✅        |
-| [`diag`](#diag)         | Ping, metrics, DERP map, update check                                | Core      | ✅        |
+| [`prefs`](#prefs)       | Subnet routes, shields, tags, and exit-node state                    | Advanced  | ✅        |
+| [`diag`](#diag)         | Ping, metrics, DERP map, and advisory native-version check           | Core      | ✅        |
 | [`whois`](#whois-top-level) | Resolve a tailnet IP to node identity                             | Core      | ✅        |
 | [Errors](#errors)       | Structured exception taxonomy                                        | Core      | ✅        |
 
@@ -67,16 +92,17 @@ returning a transitional state such as `starting`.
 
 | API | Status | Description | Example |
 | --- | ------ | ----------- | ------- |
-| `Tailscale.init({stateDir, logLevel})` | ✅ | One-time library configuration at app startup. | `Tailscale.init(stateDir: '/app/state');` |
-| `up({hostname, authKey, ephemeral, controlUrl, timeout})` → `TailscaleStatus` | ✅ | Start engine; `ephemeral: true` registers short-lived CI/test nodes. Resolves on the first stable state only. Throws `TailscaleUpException` if startup fails before that. | `final s = await tsnet.up(authKey: 'tskey-...', ephemeral: true);` |
-| `down()` | ✅ | Stop engine, keep persisted credentials. | `await tsnet.down();` |
-| `logout()` | ✅ | Stop + wipe persisted credentials. | `await tsnet.logout();` |
-| `status()` → `TailscaleStatus` | ✅ | Snapshot: state, IPs, health, MagicDNS suffix. | `final s = await tsnet.status();` |
+| `Tailscale.init({stateDir, appId, logLevel})` | ✅ | Freezes one process-wide native path/inode + exact log-level + validated host-app/derived Keybay namespace identity. Repeating the exact tuple is a no-op; a mismatch throws `TailscaleConfigurationException`. Initialization is lazy and performs no Keybay I/O. Native lifecycle calls derive the owned `tailscale/` subtree from this root. | `Tailscale.init(stateDir: '/app/state', appId: 'com.example.myapp');` |
+| `up({hostname, authKey, ephemeral, controlUrl, timeout})` → `TailscaleStatus` | ✅ | Start engine. Persistent mode authenticates or provisions the encrypted Store through one Keybay DEK and fails closed on custody/layout errors; recognized legacy state is not migrated. `ephemeral: true` requires an auth key, uses an in-memory Store plus fresh scratch, never accesses Keybay, and rejects filesystem-visible persistent package state. Same-config active calls are idempotent and an auth key never replaces the active identity. On first upstream Running, an automatic bounded `Server.Up` reset must succeed before package Running/data-plane readiness is exposed; failure quarantines the exact generation. Timeout likewise returns only after token-qualified quarantine. | `final s = await tsnet.up(authKey: 'tskey-...', ephemeral: true);` |
+| `down()` | ✅ | Stop the exact active generation and keep persisted credentials. A completed native result survives worker-response loss. Cleanup failure returns `runtimeCleanupFailed`, publishes no false clean-state transition, and blocks replacement until process restart. | `await tsnet.down();` |
+| `logout()` | ✅ | Remote-first revocation. Confirmed success lets upstream remove the logical profile while preserving the encrypted StateStore container and DEK. Reconstructs a temporary runtime after `down()` using authenticated persisted state; that internal runtime stays event-silent. Failure preserves local recovery evidence and returns `logoutIndeterminate`. A confirmed result survives worker-response loss. | `await tsnet.logout();` |
+| `forgetLocalIdentity()` | ✅ | Irreversible local-only reset. Stops any active runtime, durably records reset intent, deletes the exact Keybay DEK, and removes only the package-owned state subtree. It does not contact the control plane, so the remote node may remain. An interrupted reset returns `localResetIncomplete` and must be resumed with the same method. | `await tsnet.forgetLocalIdentity();` |
+| `status()` → `TailscaleStatus` | ✅ | Snapshot: state, IPs, health, MagicDNS suffix. While idle, it takes the state lease and authenticates the encrypted Store through Keybay: absent/authenticated-empty is `noState`, authenticated logical state is `stopped`, and custody, legacy, tamper, or reset-marker problems fail closed with typed errors. | `final s = await tsnet.status();` |
 | `nodes()` → `List<TailscaleNode>` | ✅ | Current node inventory. | `final nodes = await tsnet.nodes();` |
 | `nodeByIp(ip)` → `TailscaleNode?` | ✅ | Lookup a known node by Tailscale IP from the current inventory. | `final node = await tsnet.nodeByIp('100.64.0.5');` |
 | `onStateChange` → `Stream<NodeState>` | ✅ | Duplicate-filtered state transitions. Repeated `needsLogin` remains observable so callers can refresh `status().authUrl`. | `tsnet.onStateChange.listen(print);` |
-| `onError` → `Stream<TailscaleRuntimeError>` | ✅ | Async runtime errors pushed from Go. | `tsnet.onError.listen(report);` |
-| `onNodeChanges` → `Stream<List<TailscaleNode>>` | ✅ | Node inventory changes without polling. Replays the current inventory to new subscribers, then emits only when the node list actually changes. | `tsnet.onNodeChanges.listen(render);` |
+| `onError` → `Stream<TailscaleRuntimeError>` | ✅ | Async runtime errors pushed from Go. Unexpected worker exit produces one `worker` incident after native quarantine and idle-state classification. | `tsnet.onError.listen(report);` |
+| `onNodeChanges` → `Stream<List<TailscaleNode>>` | ✅ | Node inventory changes without polling. Replays the current inventory, emits only changes, and publishes an empty terminal snapshot after teardown so subscribers cannot retain old peers. | `tsnet.onNodeChanges.listen(render);` |
 
 ## `http`
 
@@ -119,15 +145,19 @@ plane. Handlers see plaintext bytes — TLS is terminated server-side.
 Useful for server-style apps, but not required for the package to be
 valuable.
 
-**Status:** implemented with package-native fd-backed listeners.
+**Status:** `tls.domains()` is a read-only status query and does not use the
+disabled LocalAPI certificate endpoint; it remains available as discovery and
+does not imply certificate provisioning works. `tls.bind()` is implemented with
+package-native fd-backed listeners on desktop/server builds and explicitly
+unsupported on iOS/Android in conformance with the upstream build.
 **Requires:** MagicDNS **and** HTTPS enabled on the tailnet by the
 operator. Headscale CI covers only the clear unsupported failure path; live
 Tailscale tests cover successful TLS serving against hosted Tailscale.
 
 | API | Status | Description | Example |
 | --- | ------ | ----------- | ------- |
-| `tls.bind({port, address})` → `Future<TailscaleListener>` | ✅ | TLS-terminated listener with auto-cert. Accepted connections are plaintext package-native streams. | `final l = await tsnet.tls.bind(port: 443);` |
-| `tls.domains()` → `Future<List<String>>` | ✅ | Cert SANs; preflight for `bind`. Empty = MagicDNS or HTTPS disabled on the tailnet. | `final sans = await tsnet.tls.domains();` |
+| `tls.bind({port, address})` → `Future<TailscaleListener>` | ✅ desktop/server; unsupported mobile | TLS-terminated listener with auto-cert. Accepted connections are plaintext package-native streams. | `final l = await tsnet.tls.bind(port: 443);` |
+| `tls.domains()` → `Future<List<String>>` | ✅ discovery | Advertised cert SANs. Empty = MagicDNS or HTTPS disabled. This is not proof that `bind` can fetch a cert on the platform. | `final sans = await tsnet.tls.domains();` |
 
 ## `udp`
 
@@ -146,52 +176,32 @@ remote tailnet endpoint on each delivery.
 
 ## `funnel`
 
-Public-internet HTTPS via Tailscale Funnel: publish an existing local
-HTTP service at this node's Funnel hostname. The package uses upstream
-`tsnet.ListenFunnel` for the public listener and proxies requests to the
-loopback service.
+Public-internet HTTPS via Tailscale Funnel: publish an existing local HTTP
+service at this node's Funnel hostname. R5 writes the same upstream ServeConfig
+handler used by Serve and enables `AllowFunnel` for its host and port. There is
+no package-owned Funnel listener or reverse-proxy loop.
+
+`AllowFunnel` is host:port-scoped, not path-scoped. Enabling Funnel for one path
+can make every handler on that port publicly reachable. Use a dedicated public
+port or authenticate every handler sharing it.
 
 This is explicitly optional: useful for some hosted/server apps, but
 not part of the core embedded-private-network story.
 
-**Status:** implemented for local HTTP forwarding. **Requires:** operator
-has enabled HTTPS and Funnel for this node and an allowed Funnel port
-(usually 443, 8443, or 10000). Headscale doesn't support Funnel; live
-Tailscale test only.
+**Status:** implemented and desktop/server-qualified for local HTTP forwarding.
+The R5 hosted Funnel-tailnet and Serve/Funnel swap tests passed on 2026-08-10;
+the shared ServeConfig first-`Up` reset also has a macOS production-Keybay
+process-crash/restart receipt through a private Serve mapping. Mobile remains
+unqualified pending separate device handshakes and sidecar inventory.
+**Requires:** the operator has enabled HTTPS and Funnel for this node and an
+allowed Funnel port (usually 443, 8443, or 10000). Headscale doesn't support
+Funnel, so public ingress requires hosted Tailscale evidence.
 
 | API | Status | Description | Example |
 | --- | ------ | ----------- | ------- |
-| `funnel.forward({publicPort, localPort, localAddress, path})` → `Future<TailscalePublishedService>` | ✅ | Publicly publish a local HTTP service through Funnel. | `final p = await tsnet.funnel.forward(localPort: 3000);` |
-| `funnel.clear({publicPort, path})` | ✅ | Remove a Funnel publication. | `await tsnet.funnel.clear();` |
-| `TailscalePublishedService.close()` | ✅ | Remove the publication created by `forward`. Idempotent per handle. | `await p.close();` |
-
-## `taildrop`
-
-Node-to-node file transfer ("Taildrop") over the tailnet. Sends go
-directly between nodes with no intermediary — good fit for
-mobile-to-desktop sync, collab tools, anywhere you'd otherwise stand up
-a file server. Byte streams use `Stream<Uint8List>` throughout so
-producer/consumer can pipe without intermediate buffering.
-
-This remains optional. Upstream Taildrop is still aimed at transfers
-between a user's own personal devices, so it is not a strong fit for
-generic tagged-node or service-to-service workflows.
-
-**Status:** planned. **Depends on:** the simplest stream-safe
-byte path available at the time, likely fd-backed transport or a
-LocalAPI-backed byte stream.
-
-| API | Status | Description | Example |
-| --- | ------ | ----------- | ------- |
-| `taildrop.targets()` → `Future<List<FileTarget>>` | ⛔ | Nodes eligible to receive files right now. | `final ts = await tsnet.taildrop.targets();` |
-| `taildrop.push({target, name, data, size?})` | ⛔ | Stream a file to a node. `size` enables receiver progress reporting. | `await tsnet.taildrop.push(target: t, name: 'x', data: bytes);` |
-| `taildrop.waitingFiles()` → `Future<List<WaitingFile>>` | ⛔ | Received files not yet picked up. | `final files = await tsnet.taildrop.waitingFiles();` |
-| `taildrop.awaitWaitingFiles({timeout})` | ⛔ | Block until at least one file arrives or timeout fires. | `await tsnet.taildrop.awaitWaitingFiles(timeout: ...);` |
-| `taildrop.openRead(name)` → `Stream<Uint8List>` | ⛔ | Byte-stream a received file. Caller owns persistence. | `tsnet.taildrop.openRead('x').pipe(sink);` |
-| `taildrop.delete(name)` | ⛔ | Discard a received file without reading. | `await tsnet.taildrop.delete('x');` |
-| `taildrop.onWaitingFile` → `Stream<WaitingFile>` | ⛔ | Reactive: emits each arriving file. | `tsnet.taildrop.onWaitingFile.listen(save);` |
-| `FileTarget` value type | ✅ | Node identity (nodeId, hostname, userLoginName). | `target.hostname == 'laptop'` |
-| `WaitingFile` value type | ✅ | Name + size of a received file. | `file.size > 0` |
+| `funnel.forward({publicPort, localPort, localAddress, path})` → `Future<TailscalePublishedService>` | ✅ desktop/server; mobile unqualified | Make the shared ServeConfig mapping publicly reachable. A later Serve/Funnel call at the same coordinate replaces it. | `final p = await tsnet.funnel.forward(localPort: 3000);` |
+| `funnel.clear({publicPort, path})` | ✅ desktop/server; mobile unqualified | Coordinate clear: remove the shared handler and disable Funnel visibility for its host/port. | `await tsnet.funnel.clear();` |
+| `TailscalePublishedService.close()` | ✅ where publication is supported | Remove the publication created by `forward`. Idempotent per handle. | `await p.close();` |
 
 ## `serve`
 
@@ -214,13 +224,19 @@ Serve/Funnel publications created by this package are process-scoped rather
 than persistent `tailscale serve --bg` configuration. Close the returned
 `TailscalePublishedService` explicitly; `Tailscale.down()` also removes
 package-created publications best-effort before stopping the embedded node.
+Serve and Funnel share one coordinate namespace. The latest forward at a
+port/path owns the handler and visibility mode; `close()` is exact-token and
+cannot remove a same-generation replacement or a mapping from a newer runtime.
 
-**Status:** implemented for local HTTP forwarding. Raw `ServeConfig`
-get/set remains a possible future escape hatch.
+**Status:** implemented for local HTTP forwarding. Desktop/server HTTPS and the
+R5 swap/exact-handle sequence plus a macOS production-Keybay persisted process-
+crash/restart sequence have hosted-Tailscale receipts, most recently 2026-08-10.
+Mobile HTTPS Serve remains pending and requires its own real-device and sidecar
+receipts. Raw `ServeConfig` get/set remains a possible future escape hatch.
 
 | API | Status | Description | Example |
 | --- | ------ | ----------- | ------- |
-| `serve.forward({tailnetPort, localPort, localAddress, path, https})` → `Future<TailscalePublishedService>` | ✅ | Publish a local HTTP service inside the tailnet. | `final p = await tsnet.serve.forward(tailnetPort: 443, localPort: 3000);` |
+| `serve.forward({tailnetPort, localPort, localAddress, path, https})` → `Future<TailscalePublishedService>` | ✅ desktop/server HTTPS; mobile HTTPS unqualified | Publish a local HTTP service inside the tailnet. | `final p = await tsnet.serve.forward(tailnetPort: 443, localPort: 3000);` |
 | `serve.clear({tailnetPort, path})` | ✅ | Remove a tailnet Serve publication. | `await tsnet.serve.clear(tailnetPort: 443);` |
 | `TailscalePublishedService` | ✅ | Publication handle with `url`, local target metadata, and `close()`. | `print(p.url); await p.close();` |
 
@@ -261,35 +277,13 @@ recommendation policy is control-plane-specific.
 | `exitNode.clear()` | ✅ | Stop routing through an exit node. | `await tsnet.exitNode.clear();` |
 | `exitNode.onCurrentChange` → `Stream<TailscaleNode?>` | ✅ | React to runtime exit-node selection changes. | `tsnet.exitNode.onCurrentChange.listen(update);` |
 
-## `profiles`
-
-Multi-account / multi-tailnet: one device, several identities. Useful
-for a single app operating in both a personal and a work tailnet, or
-dev vs prod. `switchTo` accepts a `LoginProfile` (type-safe) or use
-`switchToId` when you've persisted only the ID.
-
-Tracked as optional. If the package stays focused on "embed one node in
-one app", this may never be a common need.
-
-**Status:** planned.
-
-| API | Status | Description | Example |
-| --- | ------ | ----------- | ------- |
-| `profiles.current()` → `Future<LoginProfile?>` | ⛔ | Currently active profile, or null on a fresh install. | `final p = await tsnet.profiles.current();` |
-| `profiles.list()` → `Future<List<LoginProfile>>` | ⛔ | All profiles persisted on this node. | `final all = await tsnet.profiles.list();` |
-| `profiles.switchTo(LoginProfile)` | ⛔ | Disconnect + reconnect with the target profile. | `await tsnet.profiles.switchTo(work);` |
-| `profiles.switchToId(id)` | ⛔ | Escape hatch for a persisted ID. | `await tsnet.profiles.switchToId('p1');` |
-| `profiles.delete(LoginProfile)` | ⛔ | Remove profile + its persisted credentials. | `await tsnet.profiles.delete(old);` |
-| `profiles.deleteById(id)` | ⛔ | Escape hatch for delete by ID. | `await tsnet.profiles.deleteById('p1');` |
-| `profiles.newEmpty()` | ⛔ | Create an empty slot for the next `up()` with a fresh authkey. | `await tsnet.profiles.newEmpty();` |
-| `LoginProfile` value type | ✅ | `id`, `userLoginName`, `tailnetName`. | `profile.tailnetName == 'acme.com'` |
-
 ## `prefs`
 
-The long tail of node preferences — subnet routes, shields, advertised
-tags, auto-update opt-in. Common single-field changes have named
-setters (`set*` prefix for consistency); atomic multi-field edits use
-`updateMasked(PrefsUpdate)`.
+The supported long tail of node preferences — subnet routes, shields, and
+advertised tags. Current hostname and running intent are readable snapshots,
+but lifecycle authority stays with `up()` / `down()`. Common single-field
+changes have named setters (`set*` prefix for consistency); atomic multi-field
+edits use `updateMasked(PrefsUpdate)`.
 Advanced node-control surface rather than core day-one app plumbing.
 
 **Status:** implemented. Headscale covers LocalAPI prefs write/read behavior;
@@ -301,10 +295,8 @@ the on-demand live Tailscale suite covers exit-node recommendation policy.
 | `prefs.setAdvertisedRoutes(cidrs)` | ✅ | Replace advertised subnet routes. | `await tsnet.prefs.setAdvertisedRoutes(['10.0.0.0/24']);` |
 | `prefs.setAcceptRoutes(bool)` | ✅ | Accept subnet routes from other nodes. | `await tsnet.prefs.setAcceptRoutes(true);` |
 | `prefs.setShieldsUp(bool)` | ✅ | Block all inbound connections. | `await tsnet.prefs.setShieldsUp(true);` |
-| `prefs.setAutoUpdate(bool)` | ✅ | Opt in/out of tsnet auto-update. | `await tsnet.prefs.setAutoUpdate(true);` |
 | `prefs.setAdvertisedTags(tags)` | ✅ | Replace advertised ACL tags. | `await tsnet.prefs.setAdvertisedTags(['tag:prod']);` |
-| `prefs.setHostname(hostname)` | ✅ | Change this node's tailnet-visible hostname. | `await tsnet.prefs.setHostname('router');` |
-| `prefs.updateMasked(PrefsUpdate)` | ✅ | Atomic multi-field edit; unset fields stay as-is. | `await tsnet.prefs.updateMasked(PrefsUpdate(shieldsUp: true));` |
+| `prefs.updateMasked(PrefsUpdate)` | ✅ | Atomic routes, Shields Up, tags, and exit-node edit; unset fields stay as-is. | `await tsnet.prefs.updateMasked(PrefsUpdate(shieldsUp: true));` |
 
 ## `diag`
 
@@ -319,7 +311,7 @@ ICMP).
 | `diag.ping(ip, {timeout, type})` → `Future<PingResult>` | ✅ | RTT + route diagnostic. `PingResult.path` distinguishes `direct`, `derp`, and `unknown` when the chosen ping type does not expose enough metadata. `type` is one of `disco` (default, no privileges), `tsmp`, `icmp`. | `final r = await tsnet.diag.ping('100.64.0.5');` |
 | `diag.metrics()` → `Future<String>` | ✅ | Prometheus-format metrics snapshot from the embedded runtime. | `print(await tsnet.diag.metrics());` |
 | `diag.derpMap()` → `Future<DERPMap>` | ✅ | Current DERP relay map. | `final m = await tsnet.diag.derpMap();` |
-| `diag.checkUpdate()` → `Future<ClientVersion?>` | ✅ | Newer version if available, else null. Fields match `tailcfg.ClientVersion` (latestVersion, urgentSecurityUpdate, notifyText). | `final v = await tsnet.diag.checkUpdate();` |
+| `diag.checkUpdate()` → `Future<ClientVersion?>` | ✅ | Advisory newer native Tailscale version, else null. Upgrade the package or host app to apply it; the embedded runtime cannot replace itself. | `final v = await tsnet.diag.checkUpdate();` |
 | `PingResult`, `DERPMap`, `DERPRegion`, `DERPNode`, `ClientVersion` value types | ✅ | Immutable returns with `==` / `hashCode`. | `switch (ping.path) { ... }` |
 
 ## `whois` (top-level)
@@ -348,16 +340,16 @@ surface `featureDisabled`, rethrow otherwise).
 
 | Type | Status | Thrown by | Example |
 | ---- | ------ | --------- | ------- |
-| `TailscaleErrorCode` enum | ✅ | `notFound` / `forbidden` / `conflict` / `preconditionFailed` / `featureDisabled` / `unknown`. | `if (e.code == TailscaleErrorCode.conflict) retry();` |
-| `TailscaleUsageException` | ✅ | Misuse: `http.client` before `up()`, empty `stateDir`, etc. | `on TailscaleUsageException catch (_) { ... }` |
+| `TailscaleErrorCode` enum | ✅ | Includes lifecycle codes plus secure-state outcomes such as `stateLeaseBusy`, `missingStateKey`, `orphanedStateKey`, `localResetIncomplete`, `legacyStateUnsupported`, `stateAuthenticationFailed`, `invalidStateFormat`, `secureStorageLocked`, and `secureStorageUnavailable`; LocalAPI codes; and `unknown`. | `if (e.code == TailscaleErrorCode.secureStorageLocked) retryLater();` |
+| `TailscaleUsageException` | ✅ | Misuse: `http.client` before `up()`, empty `stateDir`, invalid `appId`, etc. | `on TailscaleUsageException catch (_) { ... }` |
+| `TailscaleConfigurationException` | ✅ | A repeated `init` conflicts with the process-owned state root or log level. | `on TailscaleConfigurationException catch (_) { ... }` |
 | `TailscaleUpException` | ✅ | `up()` failed before reaching a stable state. | `on TailscaleUpException catch (e) { showAuth(e); }` |
 | `TailscaleHttpException` | ✅ | `http.*`. | `on TailscaleHttpException catch (_) { ... }` |
 | `TailscaleStatusException` | ✅ | `status()`. | `on TailscaleStatusException catch (_) { ... }` |
 | `TailscaleLogoutException` | ✅ | `logout()`. | `on TailscaleLogoutException catch (_) { ... }` |
-| `TailscaleTaildropException` | ✅ | `taildrop.*`. | `on TailscaleTaildropException catch (_) { ... }` |
+| `TailscaleForgetLocalIdentityException` | ✅ | `forgetLocalIdentity()`. | `on TailscaleForgetLocalIdentityException catch (_) { ... }` |
 | `TailscaleServeException` | ✅ | `serve.*` incl. ETag conflicts. | `on TailscaleServeException catch (e) { ... }` |
 | `TailscalePrefsException` | ✅ | `prefs.*`. | `on TailscalePrefsException catch (_) { ... }` |
-| `TailscaleProfilesException` | ✅ | `profiles.*`. | `on TailscaleProfilesException catch (_) { ... }` |
 | `TailscaleExitNodeException` | ✅ | `exitNode.*`. | `on TailscaleExitNodeException catch (_) { ... }` |
 | `TailscaleDiagException` | ✅ | `diag.*`. | `on TailscaleDiagException catch (_) { ... }` |
 | `TailscaleRuntimeError` (not `Exception`) | ✅ | Async errors pushed from Go via `onError`. | `tsnet.onError.listen((e) => report(e));` |

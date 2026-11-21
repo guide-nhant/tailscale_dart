@@ -24,16 +24,42 @@ final class PosixFdTransport {
     required this.maxReadChunkSize,
     required this.maxInboundQueuedBytes,
     required this.maxPendingWriteBytes,
+    required this.datagram,
   }) {
     _fdFinalizer.attach(this, fd, detach: this);
+    // Guarantee `done` is always observed. An abnormal close completes `done`
+    // with an error, and read/write failures are already surfaced through the
+    // input stream and the per-write futures — so callers routinely never touch
+    // `done`. Without this, that unobserved error would escape as an unhandled
+    // async error and terminate a root-zone process (e.g. a `dart run` server)
+    // when a remote peer merely resets a connection. Consumers that do
+    // `await done` in a try/catch still observe the error; `ignore()` only
+    // absorbs the otherwise-orphaned completion.
+    _done.future.ignore();
   }
 
   /// Adopts [fd] and registers it with the shared POSIX fd reactor.
+  ///
+  /// Ownership contract: on success the returned transport owns [fd] and closes
+  /// it on [close]. If **reactor registration** fails, `adopt` closes [fd]
+  /// itself before throwing, so the caller must not close it again (that would
+  /// double-close a possibly-reused fd number). The only throws that leave
+  /// [fd] untouched are the up-front argument checks below (a negative fd or a
+  /// non-positive size limit) — programming errors, not runtime failures. This
+  /// lets a multi-fd caller release only the fds it still holds after a partial
+  /// failure — see `_sendOverFds` in `http_fd_client.dart`.
+  ///
+  /// Set [datagram] for a `SOCK_DGRAM` fd. Datagram reads must never be clamped
+  /// below a whole message — a short `read(2)` on a datagram socket silently
+  /// discards the tail — so in datagram mode the reactor reads a full
+  /// [maxReadChunkSize] buffer regardless of queue credit. The caller must size
+  /// [maxReadChunkSize] at or above the largest datagram the peer can send.
   static Future<PosixFdTransport> adopt(
     int fd, {
     int maxReadChunkSize = 64 * 1024,
     int maxInboundQueuedBytes = 1024 * 1024,
     int maxPendingWriteBytes = 1024 * 1024,
+    bool datagram = false,
   }) async {
     if (Platform.isWindows) {
       throw UnsupportedError('POSIX fd transport is not available on Windows.');
@@ -66,6 +92,7 @@ final class PosixFdTransport {
       maxReadChunkSize: maxReadChunkSize,
       maxInboundQueuedBytes: maxInboundQueuedBytes,
       maxPendingWriteBytes: maxPendingWriteBytes,
+      datagram: datagram,
     );
     await transport._registerWithReactor();
     return transport;
@@ -82,6 +109,10 @@ final class PosixFdTransport {
 
   /// Maximum bytes allowed in the user-space write queue.
   final int maxPendingWriteBytes;
+
+  /// Whether the adopted fd is a datagram socket, in which case reads preserve
+  /// message boundaries and are never clamped below [maxReadChunkSize].
+  final bool datagram;
 
   late final StreamController<Uint8List> _input;
   late final RawReceivePort _events;
@@ -142,6 +173,7 @@ final class PosixFdTransport {
             fd: fd,
             maxReadChunkSize: maxReadChunkSize,
             maxInboundQueuedBytes: maxInboundQueuedBytes,
+            datagram: datagram,
             eventPort: _events.sendPort,
           );
           _reactor = reactor;
@@ -445,8 +477,9 @@ const int _reactorMaxEvents = 128;
 const int _reactorMaxRegisteredTransports = 4096;
 
 /// Number of reactor shards. Each shard is its own isolate + native poller
-/// owning a disjoint subset of fds (`fd % count`), so byte I/O for concurrent
-/// flows spreads across cores instead of serializing through a single isolate
+/// owning a disjoint subset of transports (assigned round-robin at adoption),
+/// so byte I/O for concurrent flows spreads across cores instead of serializing
+/// through a single isolate
 /// — a single reactor saturates one core well before the tailnet does under
 /// many simultaneous transfers.
 ///
@@ -559,6 +592,18 @@ Future<PosixFdReactorSnapshot?> debugPosixFdReactorSnapshot() async {
   if (proxies.isEmpty) return null;
   final snapshots = await Future.wait(proxies.map((proxy) => proxy.snapshot()));
   return PosixFdReactorSnapshot.combine(snapshots);
+}
+
+/// Per-shard registered-transport counts, keyed by shard index. Lets tests and
+/// audit benchmarks verify that concurrent adoptions distribute across shards
+/// rather than pinning to one.
+Future<Map<int, int>> debugPosixFdReactorShardLoad() async {
+  final proxies = _SharedFdReactorProxy.activeProxies;
+  final load = <int, int>{};
+  for (final proxy in proxies) {
+    load[proxy.shard] = (await proxy.snapshot()).registeredTransports;
+  }
+  return load;
 }
 
 @visibleForTesting

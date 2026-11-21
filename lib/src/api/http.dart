@@ -229,6 +229,10 @@ final class _FdTailscaleHttpServer implements TailscaleHttpServer {
       onResume: _drainPendingAccepts,
       onCancel: close,
     );
+    // `close()` can complete `done` with an error and also rethrow it; callers
+    // that catch the throw but never await `done` would otherwise leak an
+    // unhandled async error. Awaiters still observe it.
+    _done.future.ignore();
   }
 
   final int bindingId;
@@ -290,6 +294,10 @@ final class _FdTailscaleHttpServer implements TailscaleHttpServer {
           bindingId,
           events.sendPort,
         ], debugName: 'tailscale-http-accept-$bindingId');
+        // If the loop isolate ever dies without sending a terminal message,
+        // its exit posts null to the events port, which routes to close() — so
+        // the server can't hang forever awaiting a dead accept isolate.
+        _acceptIsolate!.addOnExitListener(events.sendPort);
       } catch (error, stackTrace) {
         if (!_requests.isClosed) {
           _requests.addError(error, stackTrace);
@@ -300,12 +308,34 @@ final class _FdTailscaleHttpServer implements TailscaleHttpServer {
   }
 
   void _handleAcceptEvent(Object? message) {
-    if (_closed) return;
+    if (_closed) {
+      // Release the fds carried by an in-flight 'accepted' message that arrived
+      // after close; otherwise both descriptors (and the Go handler goroutine
+      // blocked on the response fd) leak until process exit.
+      if (message is List &&
+          message.length == 15 &&
+          message[0] == 'accepted' &&
+          message[1] is int &&
+          message[2] is int) {
+        closePosixFdForCleanup(message[1] as int);
+        closePosixFdForCleanup(message[2] as int);
+      }
+      return;
+    }
     if (message == null) {
       unawaited(close());
       return;
     }
     if (message is List && message.isNotEmpty && message[0] == 'error') {
+      final detail = message.length > 1 ? message[1] : 'unknown error';
+      _requests.addError(TailscaleHttpException('$detail'));
+      unawaited(close());
+      return;
+    }
+    if (message is List && message.isNotEmpty && message[0] == 'fatal') {
+      // The accept loop hit an unrecoverable condition (malformed native
+      // result or an unexpected crash). Surface it and tear down so the
+      // request stream can't silently stall.
       final detail = message.length > 1 ? message[1] : 'unknown error';
       _requests.addError(TailscaleHttpException('$detail'));
       unawaited(close());
@@ -422,10 +452,19 @@ final class _TailscaleHttpRequest implements TailscaleHttpRequest {
     required this.identity,
     required PosixFdTransport requestTransport,
     required PosixFdTransport responseTransport,
-  }) : headersAll = Map.unmodifiable(headersAll),
+  }) : // Lowercase header names to match dart:io's case-insensitive convention
+       // (and shelf's lowercase headers). The wire keys arrive canonical-cased
+       // from Go's http.Header, so `request.headers['content-type']` would
+       // otherwise miss. Go canonicalizes each header to one form, so
+       // lowercasing can't collide two distinct keys.
+       headersAll = Map.unmodifiable({
+         for (final entry in headersAll.entries)
+           entry.key.toLowerCase(): entry.value,
+       }),
        headers = Map.unmodifiable({
          for (final entry in headersAll.entries)
-           if (entry.value.isNotEmpty) entry.key: entry.value.join(', '),
+           if (entry.value.isNotEmpty)
+             entry.key.toLowerCase(): entry.value.join(', '),
        }),
        uri = Uri.parse(requestUri.isEmpty ? '/' : requestUri),
        _requestTransport = requestTransport {
@@ -504,33 +543,47 @@ final class _TailscaleHttpRequest implements TailscaleHttpRequest {
     Map<String, String>? headers,
     Object? body,
   }) async {
-    response.statusCode = statusCode;
-    if (headers != null) {
-      for (final entry in headers.entries) {
-        response.setHeader(entry.key, entry.value);
+    // Always close the response (which also closes the request-body transport
+    // via `onClose`), even if writing the body throws mid-way — otherwise a
+    // failed write would strand both fds and the Go handler goroutine until the
+    // finalizer runs. The original error still propagates out of the finally.
+    try {
+      response.statusCode = statusCode;
+      if (headers != null) {
+        for (final entry in headers.entries) {
+          response.setHeader(entry.key, entry.value);
+        }
       }
-    }
 
-    switch (body) {
-      case null:
-        break;
-      case String text:
-        final encoded = utf8.encode(text);
-        _putResponseHeaderIfAbsent(response, 'content-length', encoded.length);
-        await response.write(encoded);
-      case List<int> bytes:
-        _putResponseHeaderIfAbsent(response, 'content-length', bytes.length);
-        await response.write(bytes);
-      case Stream<List<int>> chunks:
-        await response.writeAll(chunks);
-      default:
-        final text = body.toString();
-        final encoded = utf8.encode(text);
-        _putResponseHeaderIfAbsent(response, 'content-length', encoded.length);
-        await response.write(encoded);
+      switch (body) {
+        case null:
+          break;
+        case String text:
+          final encoded = utf8.encode(text);
+          _putResponseHeaderIfAbsent(
+            response,
+            'content-length',
+            encoded.length,
+          );
+          await response.write(encoded);
+        case List<int> bytes:
+          _putResponseHeaderIfAbsent(response, 'content-length', bytes.length);
+          await response.write(bytes);
+        case Stream<List<int>> chunks:
+          await response.writeAll(chunks);
+        default:
+          final text = body.toString();
+          final encoded = utf8.encode(text);
+          _putResponseHeaderIfAbsent(
+            response,
+            'content-length',
+            encoded.length,
+          );
+          await response.write(encoded);
+      }
+    } finally {
+      await response.close();
     }
-
-    await response.close();
   }
 
   Future<void> close() async {
@@ -572,7 +625,12 @@ final class _TailscaleHttpRequest implements TailscaleHttpRequest {
 
 final class _TailscaleHttpResponse implements TailscaleHttpResponse {
   _TailscaleHttpResponse(this._transport, {Future<void> Function()? onClose})
-    : _onClose = onClose;
+    : _onClose = onClose {
+    // `close()` can complete `done` with an error and rethrow; absorb the
+    // orphaned completion so a caller that never awaits `done` can't leak an
+    // unhandled async error.
+    _done.future.ignore();
+  }
 
   final PosixFdTransport _transport;
   final Future<void> Function()? _onClose;
@@ -582,6 +640,12 @@ final class _TailscaleHttpResponse implements TailscaleHttpResponse {
   var _statusCode = 200;
   var _headSent = false;
   var _closed = false;
+
+  /// Serializes writes so unawaited sequential `write()` calls still reach the
+  /// wire in call order. Without it, the first write suspends on the head
+  /// frame's reactor ack while a later write's bytes enqueue ahead of it,
+  /// reordering the body.
+  Future<void> _writeChain = Future<void>.value();
 
   @override
   int get statusCode => _statusCode;
@@ -624,16 +688,29 @@ final class _TailscaleHttpResponse implements TailscaleHttpResponse {
   Future<void> get done => _done.future;
 
   @override
-  Future<void> write(List<int> bytes) async {
-    if (_closed) throw StateError('HTTP response is closed.');
-    if (bytes.isEmpty) {
-      await _sendHead();
-      return;
+  Future<void> write(List<int> bytes) {
+    if (_closed) {
+      return Future<void>.error(StateError('HTTP response is closed.'));
     }
+    return _enqueueWrite(() => _writeInternal(bytes));
+  }
+
+  Future<void> _writeInternal(List<int> bytes) async {
     await _sendHead();
+    if (bytes.isEmpty) return;
     await _transport.write(
       bytes is Uint8List ? bytes : Uint8List.fromList(bytes),
     );
+  }
+
+  /// Runs [op] after all previously enqueued writes complete. The internal
+  /// chain swallows errors so one failed write doesn't block later
+  /// writes/close (which surface their own failure); the returned future still
+  /// carries [op]'s error to its caller.
+  Future<void> _enqueueWrite(Future<void> Function() op) {
+    final result = _writeChain.then((_) => op());
+    _writeChain = result.then((_) {}, onError: (_, _) {});
+    return result;
   }
 
   @override
@@ -655,6 +732,10 @@ final class _TailscaleHttpResponse implements TailscaleHttpResponse {
     Object? closeError;
     StackTrace? closeStackTrace;
     try {
+      // Let any queued (possibly unawaited) writes flush before the half-close,
+      // so the body isn't truncated. The chain swallows their errors; a real
+      // transport failure resurfaces on closeWrite below.
+      await _writeChain;
       await _sendHead();
       await _transport.closeWrite();
     } catch (error, stackTrace) {
@@ -774,59 +855,81 @@ void _httpAcceptLoop(List<Object> args) {
   final bindingId = args[0] as int;
   final sendPort = args[1] as SendPort;
 
-  while (true) {
-    final resultPtr = native.duneHttpAccept(bindingId);
-    final resultJson = resultPtr.toDartString();
-    native.duneFree(resultPtr);
+  try {
+    while (true) {
+      final resultPtr = native.duneHttpAccept(bindingId);
+      final String resultJson;
+      try {
+        resultJson = resultPtr.toDartString();
+      } finally {
+        native.duneFree(resultPtr);
+      }
 
-    final result = jsonDecode(resultJson) as Map<String, dynamic>;
-    if (result['closed'] == true) {
-      sendPort.send(null);
-      return;
-    }
-    final error = result['error'] as String?;
-    if (error != null) {
-      sendPort.send(<Object>['error', error]);
-      return;
-    }
+      final decoded = jsonDecode(resultJson);
+      if (decoded is! Map<String, dynamic>) {
+        sendPort.send(<Object>[
+          'fatal',
+          'native accept returned malformed result',
+        ]);
+        return;
+      }
+      final result = decoded;
+      if (result['closed'] == true) {
+        sendPort.send(null);
+        return;
+      }
+      final error = result['error'] as String?;
+      if (error != null) {
+        sendPort.send(<Object>['error', error]);
+        return;
+      }
 
-    final requestBodyFd = result['requestBodyFd'] as int?;
-    final responseBodyFd = result['responseBodyFd'] as int?;
-    if (requestBodyFd == null ||
-        requestBodyFd < 0 ||
-        responseBodyFd == null ||
-        responseBodyFd < 0) {
-      sendPort.send(<Object>[
-        'error',
-        'native accept returned invalid HTTP fds',
+      final requestBodyFd = result['requestBodyFd'] as int?;
+      final responseBodyFd = result['responseBodyFd'] as int?;
+      if (requestBodyFd == null ||
+          requestBodyFd < 0 ||
+          responseBodyFd == null ||
+          responseBodyFd < 0) {
+        sendPort.send(<Object>[
+          'error',
+          'native accept returned invalid HTTP fds',
+        ]);
+        return;
+      }
+
+      // Identity is attached by the backend at accept time when the caller's IP
+      // resolves to a known node; absent for Funnel/unknown callers. Decode it
+      // here so the immutable value crosses the isolate boundary already typed,
+      // mirroring the TCP accept loop.
+      final identityJson = result['identity'];
+      final identity = identityJson is Map<String, dynamic>
+          ? TailscaleNodeIdentity.fromJson(identityJson)
+          : null;
+      sendPort.send(<Object?>[
+        'accepted',
+        requestBodyFd,
+        responseBodyFd,
+        result['method'] as String? ?? 'GET',
+        result['requestUri'] as String? ?? '/',
+        result['host'] as String? ?? '',
+        result['proto'] as String? ?? 'HTTP/1.1',
+        result['headers'],
+        result['contentLength'],
+        result['remoteAddress'] as String? ?? '',
+        result['remotePort'] as int? ?? 0,
+        result['localAddress'] as String? ?? '',
+        result['localPort'] as int? ?? 0,
+        result['bindingId'] as int? ?? bindingId,
+        identity,
       ]);
-      return;
     }
-
-    // Identity is attached by the backend at accept time when the caller's IP
-    // resolves to a known node; absent for Funnel/unknown callers. Decode it
-    // here so the immutable value crosses the isolate boundary already typed,
-    // mirroring the TCP accept loop.
-    final identityJson = result['identity'];
-    final identity = identityJson is Map<String, dynamic>
-        ? TailscaleNodeIdentity.fromJson(identityJson)
-        : null;
-    sendPort.send(<Object?>[
-      'accepted',
-      requestBodyFd,
-      responseBodyFd,
-      result['method'] as String? ?? 'GET',
-      result['requestUri'] as String? ?? '/',
-      result['host'] as String? ?? '',
-      result['proto'] as String? ?? 'HTTP/1.1',
-      result['headers'],
-      result['contentLength'],
-      result['remoteAddress'] as String? ?? '',
-      result['remotePort'] as int? ?? 0,
-      result['localAddress'] as String? ?? '',
-      result['localPort'] as int? ?? 0,
-      result['bindingId'] as int? ?? bindingId,
-      identity,
+  } catch (error) {
+    // A malformed native result or any other unexpected throw would otherwise
+    // kill this isolate silently and hang the parent's request stream. Surface
+    // it as a terminal 'fatal' so the parent errors out and closes.
+    sendPort.send(<Object>[
+      'fatal',
+      'tailnet HTTP accept loop crashed: $error',
     ]);
   }
 }

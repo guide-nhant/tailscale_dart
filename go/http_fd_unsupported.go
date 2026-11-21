@@ -32,6 +32,7 @@ type HttpIncomingRequest struct {
 }
 
 func HttpStart(
+	runtimeToken uint64,
 	method string,
 	rawURL string,
 	headersJSON string,
@@ -39,10 +40,11 @@ func HttpStart(
 	followRedirects bool,
 	maxRedirects int,
 ) (*HttpFdRequest, error) {
+	_ = runtimeToken
 	return nil, fmt.Errorf("HTTP fd transport is not supported on this platform")
 }
 
-func HttpBind(tailnetPort int) (*HttpBinding, error) {
+func HttpBind(runtimeToken uint64, tailnetPort int) (*HttpBinding, error) {
 	return nil, fmt.Errorf("HTTP fd transport is not supported on this platform")
 }
 
@@ -51,5 +53,3 @@ func HttpAccept(bindingID int64) (*HttpIncomingRequest, bool, error) {
 }
 
 func HttpCloseBinding(bindingID int64) {}
-
-func closeAllHttpBindings() {}

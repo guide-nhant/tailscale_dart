@@ -3,7 +3,10 @@ const examples = {
     title: "quick_start.dart",
     code: `import 'package:tailscale/tailscale.dart';
 
-Tailscale.init(stateDir: '/app/tailscale');
+Tailscale.init(
+  stateDir: '/app/tailscale',
+  appId: 'com.example.myapp',
+);
 final ts = Tailscale.instance;
 
 await ts.up(authKey: 'tskey-auth-...');
@@ -68,7 +71,9 @@ socket.datagrams.listen((datagram) async {
   },
   tls: {
     title: "tls_listener.dart",
-    code: `final listener = await ts.tls.bind(port: 443);
+    code: `// Desktop/server only; default tsnet certificate fetching is
+// unavailable on iOS and Android.
+final listener = await ts.tls.bind(port: 443);
 final domains = await ts.tls.domains();
 
 print('serving \${domains.first}');
@@ -105,13 +110,15 @@ print(server.tailnet);`,
   },
   funnel: {
     title: "serve_funnel.dart",
-    code: `// Forward an existing loopback HTTP server.
+    code: `// Desktop/server qualified; mobile HTTPS remains unqualified.
+// Serve and Funnel share one mapping authority.
 final serve = await ts.serve.forward(
-  tailnetPort: 443,
+  tailnetPort: 8443,
   localPort: 8080,
   path: '/admin',
 );
 
+// Funnel visibility is port-wide, so use a dedicated public port.
 final funnel = await ts.funnel.forward(
   publicPort: 443,
   localPort: 8080,

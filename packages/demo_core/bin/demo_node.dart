@@ -45,6 +45,8 @@ Future<void> _serve(_Args args) async {
     throw const _UsageException('serve requires --state-dir or STATE_DIR');
   }
   final hostname = args.optionOrEnv('hostname', 'HOSTNAME') ?? 'demo-node';
+  final appId =
+      args.optionOrEnv('app-id', 'APP_ID') ?? 'dev.tailscale.dart.demo.cli';
   final authKey = args.optionOrEnv('auth-key', 'AUTH_KEY');
   final controlUrl = _optionalUri(
     args.optionOrEnv('control-url', 'CONTROL_URL'),
@@ -60,6 +62,7 @@ Future<void> _serve(_Args args) async {
   final status = await _upAndWaitRunning(
     demo,
     stateDir: stateDir,
+    appId: appId,
     hostname: hostname,
     authKey: authKey,
     ephemeral: args.flag('ephemeral'),
@@ -136,6 +139,8 @@ Future<bool> _probe(_Args args) async {
     throw const _UsageException('probe requires --node or NODE_IP');
   }
   final hostname = args.optionOrEnv('hostname', 'HOSTNAME') ?? 'demo-probe';
+  final appId =
+      args.optionOrEnv('app-id', 'APP_ID') ?? 'dev.tailscale.dart.demo.cli';
   final authKey = args.optionOrEnv('auth-key', 'AUTH_KEY');
   final controlUrl = _optionalUri(
     args.optionOrEnv('control-url', 'CONTROL_URL'),
@@ -144,6 +149,7 @@ Future<bool> _probe(_Args args) async {
   await _upAndWaitRunning(
     demo,
     stateDir: stateDir,
+    appId: appId,
     hostname: hostname,
     authKey: authKey,
     ephemeral: args.flag('ephemeral'),
@@ -180,6 +186,7 @@ Future<bool> _pair(_Args args) async {
     name: 'a',
     packageRoot: packageRoot,
     stateDir: '$stateRoot/a',
+    appId: 'dev.tailscale.dart.demo.pair.a',
     hostname: args.option('hostname-a') ?? 'demo-local-a',
     authKey: authKey,
     ephemeral: args.flag('ephemeral'),
@@ -196,6 +203,7 @@ Future<bool> _pair(_Args args) async {
       name: 'b',
       packageRoot: packageRoot,
       stateDir: '$stateRoot/b',
+      appId: 'dev.tailscale.dart.demo.pair.b',
       hostname: args.option('hostname-b') ?? 'demo-local-b',
       authKey: authKey,
       ephemeral: args.flag('ephemeral'),
@@ -241,6 +249,7 @@ Future<bool> _pair(_Args args) async {
 Future<TailscaleStatus> _upAndWaitRunning(
   DemoCore demo, {
   required String stateDir,
+  required String appId,
   required String hostname,
   required String? authKey,
   required bool ephemeral,
@@ -250,6 +259,7 @@ Future<TailscaleStatus> _upAndWaitRunning(
   final running = demo.onStateChange.firstWhere((s) => s == NodeState.running);
   final status = await demo.up(
     stateDir: stateDir,
+    appId: appId,
     hostname: hostname,
     authKey: authKey,
     ephemeral: ephemeral,
@@ -379,6 +389,7 @@ final class _ManagedNode {
     required String name,
     required String packageRoot,
     required String stateDir,
+    required String appId,
     required String hostname,
     required String authKey,
     required bool ephemeral,
@@ -387,11 +398,12 @@ final class _ManagedNode {
   }) async {
     final process = await Process.start(Platform.resolvedExecutable, [
       'run',
-      '--enable-experiment=native-assets',
       'bin/demo_node.dart',
       'serve',
       '--state-dir',
       stateDir,
+      '--app-id',
+      appId,
       '--hostname',
       hostname,
       '--auth-key',
@@ -555,15 +567,16 @@ final class _UsageException implements Exception {
 void _printUsage() {
   stdout.writeln('''
 Usage:
-  dart run --enable-experiment=native-assets bin/demo_node.dart serve \\
-    --state-dir /tmp/dune-a --hostname demo-a --auth-key tskey-auth-...
+  dart run bin/demo_node.dart serve \\
+    --state-dir /tmp/dune-a --hostname demo-a --auth-key tskey-auth-... \\
+    --ephemeral
 
-  dart run --enable-experiment=native-assets bin/demo_node.dart probe \\
+  dart run bin/demo_node.dart probe \\
     --state-dir /tmp/dune-b --hostname demo-b --auth-key tskey-auth-... \\
-    --node 100.x.y.z
+    --node 100.x.y.z --ephemeral
 
-  dart run --enable-experiment=native-assets bin/demo_node.dart pair \\
-    --auth-key tskey-auth-... --control-url http://localhost:8080
+  dart run bin/demo_node.dart pair \\
+    --auth-key tskey-auth-... --control-url http://localhost:8080 --ephemeral
 
 Commands:
   serve   Join, start HTTP/TCP/UDP demo services, print READY, stay alive.
@@ -574,9 +587,10 @@ Commands:
 
 Common options:
   --state-dir DIR
+  --app-id ID
   --hostname NAME
   --auth-key KEY
-  --ephemeral
+  --ephemeral       Use an in-memory StateStore and no Keybay custody.
   --control-url URL
   --stdin-control
   --verbose

@@ -42,6 +42,80 @@ void main() {
       },
     );
 
+    test('lowercases inbound request header names', () async {
+      // Go forwards canonical-cased header keys; the request must expose them
+      // lowercase so `request.headers['content-type']` (dart:io / shelf
+      // convention) works instead of missing.
+      final (
+        :requestPeer,
+        :responsePeer,
+        :responseSub,
+        :request,
+      ) = await _requestWithBody(
+        headersAll: const {
+          'Content-Type': ['application/json'],
+          'X-Custom-Header': ['a', 'b'],
+        },
+      );
+      addTearDown(() => _closePeers(requestPeer, responsePeer, responseSub));
+      // This test never calls respond()/response.close(), so close the request's
+      // own transports here or they stay registered and the reactor never
+      // idle-exits (the VM then hangs waiting for the shard isolate at exit).
+      addTearDown(() => request.response.close());
+
+      expect(request.headers['content-type'], 'application/json');
+      expect(request.headers['x-custom-header'], 'a, b');
+      expect(request.headersAll['content-type'], ['application/json']);
+      // Original canonical case no longer present.
+      expect(request.headers.containsKey('Content-Type'), isFalse);
+    });
+
+    test('serializes unawaited sequential writes in call order', () async {
+      final responseBytes = <int>[];
+      final (
+        :requestPeer,
+        :responsePeer,
+        :responseSub,
+        :request,
+      ) = await _requestWithBody(
+        onResponseChunk: (chunk) => responseBytes.addAll(chunk),
+      );
+      addTearDown(() => _closePeers(requestPeer, responsePeer, responseSub));
+
+      // Fire-and-forget, IOSink-style. Without write serialization the first
+      // write suspends on the head frame's ack while the second's bytes enqueue
+      // ahead of it, producing wire order head, BBBB, AAAA.
+      unawaited(request.response.write(utf8.encode('AAAA')));
+      unawaited(request.response.write(utf8.encode('BBBB')));
+      await request.response.close();
+      await responseSub.asFuture<void>().timeout(const Duration(seconds: 5));
+
+      final body = _responseBodyAfterHead(Uint8List.fromList(responseBytes));
+      expect(utf8.decode(body), 'AAAABBBB');
+    });
+
+    test('respond closes transports even when the body write fails', () async {
+      final (:requestPeer, :responsePeer, :responseSub, :request) =
+          await _requestWithBody();
+      addTearDown(() => _closePeers(requestPeer, responsePeer, responseSub));
+
+      // Break the response path so the body write fails with EPIPE.
+      await responseSub.cancel();
+      await responsePeer.close();
+
+      await expectLater(
+        request.respond(body: 'payload').timeout(const Duration(seconds: 5)),
+        throwsA(isA<Object>()),
+      );
+
+      // Despite the failed write, respond()'s finally still closed the response
+      // (and via onClose the request transport), so the request peer sees EOF.
+      await expectLater(
+        requestPeer.input.isEmpty.timeout(const Duration(seconds: 5)),
+        completion(isTrue),
+      );
+    });
+
     test('respond does not duplicate content-length by case', () async {
       final responseBytes = <int>[];
       final (
@@ -75,7 +149,10 @@ Future<
     TailscaleHttpRequest request,
   })
 >
-_requestWithBody({void Function(Uint8List chunk)? onResponseChunk}) async {
+_requestWithBody({
+  void Function(Uint8List chunk)? onResponseChunk,
+  Map<String, List<String>> headersAll = const {},
+}) async {
   final (leftFd: requestLeftFd, rightFd: requestRightFd) = socketPair(
     sockStream,
   );
@@ -98,6 +175,7 @@ _requestWithBody({void Function(Uint8List chunk)? onResponseChunk}) async {
       responsePeer: responsePeer,
       responseSub: responseSub,
       request: createHttpRequestForTesting(
+        headersAll: headersAll,
         requestTransport: requestTransport,
         responseTransport: responseTransport,
       ),
@@ -125,6 +203,11 @@ Map<String, Object?> _decodeResponseHeaders(Uint8List bytes) {
   final headLength = ByteData.sublistView(bytes).getUint32(0, Endian.big);
   final head = jsonDecode(utf8.decode(bytes.sublist(4, 4 + headLength)));
   return ((head as Map<String, dynamic>)['headers'] as Map).cast();
+}
+
+Uint8List _responseBodyAfterHead(Uint8List bytes) {
+  final headLength = ByteData.sublistView(bytes).getUint32(0, Endian.big);
+  return Uint8List.sublistView(bytes, 4 + headLength);
 }
 
 Future<void> _closePeers(

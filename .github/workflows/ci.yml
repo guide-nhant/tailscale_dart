@@ -16,71 +16,105 @@ jobs:
     name: Go tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          cache-dependency-path: go/go.sum
+      - name: Vet
+        working-directory: go
+        run: go vet ./...
       - name: Run Go tests
         working-directory: go
-        run: go test -v -count=1 ./...
+        # -race: the teardown/reactor tests were written to stress register-vs-
+        # teardown under the race detector (see node_gate_test.go); gate on it.
+        run: go test -race -v -count=1 ./...
+
+  android-build:
+    name: Android cross-build (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    # Every ABI we ship. Nothing else in CI compiles for Android, so an
+    # Android-only build break could otherwise reach a release unnoticed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: arm64
+            cc: aarch64-linux-android24-clang
+          - goarch: amd64
+            cc: x86_64-linux-android24-clang
+          - goarch: arm
+            cc: armv7a-linux-androideabi24-clang
+          - goarch: '386'
+            cc: i686-linux-android24-clang
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache-dependency-path: go/go.sum
+      # Pin NDK 28.2 because its clang target triples are part of this matrix.
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r28c
+          # The action's repository cache uses one immutable key per NDK and
+          # OS. A prior matrix run populated that key with an archive missing
+          # bin/clang, so prefer a fresh, deterministic pinned-NDK install.
+          local-cache: false
+      - name: Build
+        working-directory: go
+        env:
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+        run: |
+          CC="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
+          echo "CC=$CC"
+          # Match hook/build.dart's shipped Android artifact, including cgo's
+          # c-shared link step and the actual FFI entry point.
+          CC="$CC" go build \
+            -buildmode=c-shared \
+            -tags 'ts_omit_listenrawdisco ts_omit_portmapper' \
+            -o "/tmp/libtailscale-${GOARCH}.so" \
+            ./cmd/dylib/main.go
 
   dart-tests:
     name: Dart tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: stable
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          cache-dependency-path: go/go.sum
       - run: dart pub get
       - name: Analyze
         run: dart analyze lib/ test/ hook/
       - name: Tests
-        # Runs test/unit and test/integration. test/e2e is discovered too, but
-        # bails out unless HEADSCALE_* env vars are set; the real Headscale run
-        # has its own job below. dart_test.yaml pins concurrency to 1 so native
-        # runtime tests don't stomp per-process global state.
-        run: dart test
+        # Hosted Tailscale receipts are opt-in even when a developer or runner
+        # happens to export credentials. Headscale has its own job below.
+        # dart_test.yaml pins concurrency to 1 so native runtime tests don't
+        # stomp per-process global state.
+        run: dart test --exclude-tags live-tailscale
 
   e2e-tests:
-    name: E2E (Headscale)
+    name: E2E (Headscale, Dart 3.12 floor)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dart-lang/setup-dart@v1
         with:
-          sdk: stable
-      - uses: actions/setup-go@v6
+          # This lane exercises the minimum SDK's native-assets subprocess
+          # behavior; other Dart and performance jobs follow current stable.
+          sdk: 3.12.0
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          cache-dependency-path: go/go.sum
       - run: dart pub get
-      - name: Start Headscale
-        run: docker compose -f test/e2e/docker-compose.yml up -d --wait
-      - name: Wait for Headscale
-        run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/health > /dev/null 2>&1 && break
-            sleep 1
-          done
-      - name: Create user and auth keys
-        id: headscale
-        run: |
-          docker compose -f test/e2e/docker-compose.yml exec -T headscale headscale users create dune-test || true
-          # Disposable peer nodes use an ephemeral key; reconnect/persistence
-          # assertions use a separate non-ephemeral key.
-          AUTH_KEY=$(docker compose -f test/e2e/docker-compose.yml exec -T headscale headscale preauthkeys create --user dune-test --reusable --ephemeral --expiration 10m | tail -1)
-          PERSIST_AUTH_KEY=$(docker compose -f test/e2e/docker-compose.yml exec -T headscale headscale preauthkeys create --user dune-test --reusable --expiration 10m | tail -1)
-          echo "auth_key=$AUTH_KEY" >> "$GITHUB_OUTPUT"
-          echo "persist_auth_key=$PERSIST_AUTH_KEY" >> "$GITHUB_OUTPUT"
-      - name: Run E2E tests
-        env:
-          HEADSCALE_URL: http://localhost:8080
-          HEADSCALE_AUTH_KEY: ${{ steps.headscale.outputs.auth_key }}
-          HEADSCALE_PERSIST_AUTH_KEY: ${{ steps.headscale.outputs.persist_auth_key }}
-        run: dart test test/e2e/e2e_test.dart --timeout=360s
-      - name: Teardown
-        if: always()
-        run: docker compose -f test/e2e/docker-compose.yml down -v
+      - name: Run Headscale E2E and R8 receipts
+        run: test/e2e/run_e2e.sh

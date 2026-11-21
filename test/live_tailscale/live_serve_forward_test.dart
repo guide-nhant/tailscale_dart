@@ -22,8 +22,8 @@ import 'dart:io';
 import 'package:tailscale/tailscale.dart';
 import 'package:test/test.dart';
 
-import '../e2e/support/native_asset_workaround.dart';
 import '../e2e/support/state_waiters.dart';
+import '../integration/support/process_state_root.dart';
 import 'support/tailscale_api.dart';
 
 void main() {
@@ -71,7 +71,7 @@ void main() {
     }
     try {
       final dir = stateDir;
-      if (dir != null) Directory(dir).deleteSync(recursive: true);
+      if (dir != null) clearProcessIntegrationState(Directory(dir));
     } catch (_) {}
     try {
       final dir = clientStateDir;
@@ -87,17 +87,17 @@ void main() {
   test(
     'serve.forward proxies HTTPS tailnet traffic to a loopback HTTP server',
     () async {
-      await warmUpNativeAssetForPeerSubprocesses();
-
       api = LiveTailscaleApi(apiKey: apiKey, tailnetId: tailnetId);
-      stateDir = Directory.systemTemp
-          .createTempSync('tailscale_live_serve_')
-          .path;
+      final processStateRoot = processIntegrationStateRoot();
+      clearProcessIntegrationState(processStateRoot);
+      stateDir = processStateRoot.path;
       final authKey = await api!.createAuthKey();
+      final replacementAuthKey = await api!.createAuthKey();
       final clientAuthKey = await api!.createAuthKey();
+      final cleanupPathClientAuthKey = await api!.createAuthKey();
       final cleanupClientAuthKey = await api!.createAuthKey();
 
-      Tailscale.init(stateDir: stateDir!);
+      Tailscale.init(stateDir: stateDir!, appId: processIntegrationAppId);
       tsnet = Tailscale.instance;
       await recordUntil(
         tsnet!,
@@ -135,6 +135,7 @@ void main() {
             .path;
         final response = await _runClientFetch(
           stateDir: clientStateDir!,
+          appId: 'dev.tailscale.dart.live.serve.client',
           hostname: clientHostname,
           authKey: clientAuthKey,
           controlUrl: controlUrl,
@@ -162,8 +163,12 @@ void main() {
         final cleanupUrl = Uri.https(domains.first, '/cleanup');
         final cleanupResponse = await _runClientFetch(
           stateDir: clientStateDir!,
+          appId: 'dev.tailscale.dart.live.serve.client',
           hostname: clientHostname,
-          authKey: clientAuthKey,
+          // Ephemeral clients do not retain identity, and live auth keys are
+          // intentionally single-use. Each subprocess therefore needs a new
+          // key even when the scratch directory and hostname are reused.
+          authKey: cleanupPathClientAuthKey,
           controlUrl: controlUrl,
           url: cleanupUrl,
         );
@@ -174,16 +179,17 @@ void main() {
         expect(cleanupResponse.statusCode, 200);
         expect(cleanupResponse.body, 'hello from serve');
 
-        // Do not close cleanupPublication. down() should remove package-owned
-        // Serve config before stopping so the mapping does not come back after
-        // a process restart with the same state directory.
+        // Do not close cleanupPublication. This is an orderly down/up smoke:
+        // down() should remove package-owned Serve config before a fresh
+        // ephemeral identity starts in the same Dart process. It does not
+        // exercise process death or persisted-state crash recovery.
         await tsnet!.down();
         await recordUntil(
           tsnet!,
           NodeState.running,
           () => tsnet!.up(
             hostname: hostname,
-            authKey: authKey,
+            authKey: replacementAuthKey,
             ephemeral: true,
             controlUrl: controlUri(),
             timeout: const Duration(seconds: 120),
@@ -194,12 +200,14 @@ void main() {
         cleanupClientStateDir = Directory.systemTemp
             .createTempSync('tailscale_live_serve_cleanup_client_')
             .path;
-        final cleanupAfterRestart = await _runClientFetchOutcome(
+        final cleanupAfterReplacement = await _runClientFetchOutcome(
           stateDir: cleanupClientStateDir!,
+          appId: 'dev.tailscale.dart.live.serve.cleanupClient',
           hostname: cleanupClientHostname,
           authKey: cleanupClientAuthKey,
           controlUrl: controlUrl,
           url: cleanupUrl,
+          fetchBudget: const Duration(seconds: 20),
         );
         try {
           final cleanupClientDevice = await api!.waitForDevice(
@@ -207,11 +215,11 @@ void main() {
           );
           deviceIdsToDelete.add(cleanupClientDevice.id);
         } catch (_) {}
-        if (cleanupAfterRestart.statusCode == 200 &&
-            cleanupAfterRestart.body == 'hello from serve') {
+        if (cleanupAfterReplacement.statusCode == 200 &&
+            cleanupAfterReplacement.body == 'hello from serve') {
           fail(
-            'serve.forward publication survived down()/restart without an '
-            'explicit close().',
+            'serve.forward publication survived an orderly down/up lifecycle '
+            'replacement without an explicit close().',
           );
         }
       } finally {
@@ -219,7 +227,7 @@ void main() {
         await localRequests.catchError((_) {});
       }
     },
-    timeout: const Timeout(Duration(minutes: 3)),
+    timeout: const Timeout(Duration(minutes: 12)),
   );
 }
 
@@ -233,6 +241,7 @@ Future<void> _serveLoopback(HttpServer server) async {
 
 Future<({int statusCode, String body})> _runClientFetch({
   required String stateDir,
+  required String appId,
   required String hostname,
   required String authKey,
   required String? controlUrl,
@@ -240,6 +249,7 @@ Future<({int statusCode, String body})> _runClientFetch({
 }) async {
   final outcome = await _runClientFetchOutcome(
     stateDir: stateDir,
+    appId: appId,
     hostname: hostname,
     authKey: authKey,
     controlUrl: controlUrl,
@@ -254,25 +264,24 @@ Future<({int statusCode, String body})> _runClientFetch({
 
 Future<({int? statusCode, String body, String? error})> _runClientFetchOutcome({
   required String stateDir,
+  required String appId,
   required String hostname,
   required String authKey,
   required String? controlUrl,
   required Uri url,
+  Duration fetchBudget = const Duration(seconds: 150),
 }) async {
-  await detachLoadedNativeAssetForPeerSubprocesses();
   final process = await Process.start(
     Platform.resolvedExecutable,
-    [
-      'run',
-      '--enable-experiment=native-assets',
-      'test/live_tailscale/live_tls_fetch_main.dart',
-    ],
+    ['run', 'test/live_tailscale/live_tls_fetch_main.dart'],
     environment: {
       ...Platform.environment,
       'STATE_DIR': stateDir,
+      'APP_ID': appId,
       'HOSTNAME': hostname,
       'AUTH_KEY': authKey,
       'URL': url.toString(),
+      'FETCH_BUDGET_SECONDS': '${fetchBudget.inSeconds}',
       if (controlUrl != null && controlUrl.isNotEmpty)
         'CONTROL_URL': controlUrl,
     },
@@ -316,7 +325,7 @@ Future<({int? statusCode, String body, String? error})> _runClientFetchOutcome({
   );
 
   try {
-    return await result.future.timeout(const Duration(seconds: 90));
+    return await result.future.timeout(const Duration(minutes: 5));
   } finally {
     try {
       process.kill(ProcessSignal.sigterm);

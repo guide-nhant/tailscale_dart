@@ -6,7 +6,7 @@
 
 [![pub package](https://img.shields.io/pub/v/tailscale.svg)](https://pub.dev/packages/tailscale)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/danReynolds/tailscale_dart/blob/main/LICENSE)
-[![Dart 3.10.4+](https://img.shields.io/badge/Dart-3.10.4+-0175C2?logo=dart&logoColor=white)](https://dart.dev)
+[![Dart 3.12+](https://img.shields.io/badge/Dart-3.12+-0175C2?logo=dart&logoColor=white)](https://dart.dev)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android%20%7C%20macOS%20%7C%20Linux-brightgreen.svg)](#platform-support)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-70ffb1.svg)](https://danreynolds.github.io/tailscale_dart/)
 [![API reference](https://img.shields.io/badge/api-dartdoc-0175C2.svg)](https://danreynolds.github.io/tailscale_dart/api/)
@@ -15,7 +15,7 @@ Build Dart and Flutter apps that talk to each other directly — no public serve
 
 `package:tailscale` embeds upstream Go [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) and exposes typed Dart APIs for lifecycle, node identity, HTTP, TCP, UDP, TLS, Serve, Funnel, prefs, exit nodes, and diagnostics. Your app authenticates as its own node on the tailnet — users never install or configure a Tailscale client.
 
-> **Status:** `0.4.0`, pre-1.0. The core API is stable enough to build on, but minor versions may include breaking changes until 1.0. Production users are welcome — please [open an issue](https://github.com/danReynolds/tailscale_dart/issues) or [start a discussion](https://github.com/danReynolds/tailscale_dart/discussions) if something blocks you.
+> **Status:** `0.8.1`, pre-1.0. The core API is stable enough to build on, but minor versions may include breaking changes until 1.0. Production users are welcome — please [open an issue](https://github.com/danReynolds/tailscale_dart/issues) or [start a discussion](https://github.com/danReynolds/tailscale_dart/discussions) if something blocks you.
 
 ## Documentation
 
@@ -28,15 +28,28 @@ The [**developer site**](https://danreynolds.github.io/tailscale_dart/) is the c
 | [pub.dev](https://pub.dev/packages/tailscale) | Install, versions |
 | [CHANGELOG](https://github.com/danReynolds/tailscale_dart/blob/main/CHANGELOG.md) | Release notes and breaking changes |
 | [`example/`](https://github.com/danReynolds/tailscale_dart/tree/main/example) | Runnable Dart snippets |
-| [`doc/`](https://github.com/danReynolds/tailscale_dart/tree/main/doc) | API status, roadmap, RFCs, and architecture notes |
+| [Rearchitecture plan](https://github.com/danReynolds/tailscale_dart/blob/main/doc/rearchitecture-plan.md) | Implementation status, remaining gates, historical work disposition, and acceptance criteria |
+| [Runtime lifecycle ADR](https://github.com/danReynolds/tailscale_dart/blob/main/doc/adr-runtime-ownership-and-lifecycle.md) | Per-lifecycle ownership, enrollment semantics, and automatic fail-safe teardown |
+| [Encrypted-state ADR](https://github.com/danReynolds/tailscale_dart/blob/main/doc/adr-encrypted-node-state.md) | Direct Keybay custody binding, encrypted StateStore, failure matrix, and no-migration reset policy |
+| [`doc/`](https://github.com/danReynolds/tailscale_dart/tree/main/doc) | Status-labeled index of API docs, ADRs, RFCs, and current-architecture notes |
 | [`test/README.md`](https://github.com/danReynolds/tailscale_dart/blob/main/test/README.md) | Test tiers, Headscale E2E, and live Tailscale suites |
+
+> **Architecture work in progress.** The secure-state cutover, fail-safe
+> lifecycle, runtime-owned Serve/Funnel convergence, and R7 ownership moves are
+> implemented in the current source. The hosted Funnel-tailnet, replacement,
+> and macOS production-Keybay process-crash/restart receipts passed on
+> 2026-08-10. R8 retained the identity cache from measured evidence, R9's
+> conformance audit is complete, and non-device R6 inventory/backup integration
+> is present. Exact-main Android arm64 emulator and iOS simulator Headscale
+> smoke passed on 2026-08-11. Real-device custody, backup readback,
+> data-plane/publication, and final launch receipts remain.
 
 ## What you can build
 
 - A **Flutter chat or collaboration app** where peers reach each other directly when possible — without you running relay or signaling infrastructure.
-- A **headless Dart service** that joins your tailnet and exposes private HTTPS without opening any public port.
+- A **headless Dart service** that joins ephemerally and exposes private HTTPS without opening any public port.
 - An **on-device dashboard** that calls private internal APIs (Grafana, Home Assistant, internal admin) without a corporate VPN.
-- A **shared Funnel endpoint** — publish a local development server to the public internet, terminated with a real cert by Tailscale.
+- A **shared Funnel endpoint** on desktop/server today — publish a local development server to the public internet, terminated with a real cert by Tailscale.
 - Anything you'd reach for a [WireGuard](https://www.wireguard.com/) or [libp2p](https://libp2p.io/) library for, but you'd rather use Tailscale's identity, ACLs, and DERP fallback than build them yourself.
 
 ### When this is the right choice
@@ -55,16 +68,17 @@ The [**developer site**](https://danreynolds.github.io/tailscale_dart/) is the c
 
 ```yaml
 dependencies:
-  tailscale: ^0.4.0
+  tailscale: ^0.8.1
 ```
 
 The first `dart run`, `dart test`, or `flutter build` triggers a native build hook that compiles the Go runtime for the target platform. Subsequent builds are cached and only recompile when Go source changes.
 
 Prerequisites:
 
-- Dart SDK 3.10.4 or newer.
+- Dart SDK 3.12 or newer. Flutter apps need Flutter 3.44 or newer; use
+  Flutter 3.44.6+ on Linux for its native-assets bundle fix.
 - Go 1.26 or newer on `PATH` (or Go 1.25+ with the default
-  `GOTOOLCHAIN=auto`, which auto-fetches the 1.26.4 toolchain that
+  `GOTOOLCHAIN=auto`, which auto-fetches the 1.26.5 toolchain that
   `tailscale.com` requires).
 - Native toolchain for the target platform: Xcode for iOS/macOS, Android NDK through Flutter for Android, and a C toolchain for Linux.
 
@@ -74,7 +88,10 @@ Prerequisites:
 import 'package:tailscale/tailscale.dart';
 
 Future<void> main() async {
-  Tailscale.init(stateDir: '/app/state');
+  Tailscale.init(
+    stateDir: '/app/state',
+    appId: 'com.example.myapp',
+  );
 
   final tailscale = Tailscale.instance;
   final status = await tailscale.up(
@@ -87,9 +104,40 @@ Future<void> main() async {
 }
 ```
 
-Subsequent launches can call `up()` without an auth key. The node identity is persisted in `stateDir`.
+`appId` is the embedding application's stable identifier (normally its
+reverse-DNS bundle/application ID). Tailscale reserves `<appId>.tailscale` as a
+dedicated Keybay namespace; keep the same `appId` and `stateDir` for the life
+of the installation. `init` validates and freezes that binding but does not
+access secure storage until a persistent runtime needs custody.
 
-> **Securing `stateDir`.** This directory holds the node's WireGuard private key (stored owner-only, in a `0700` subdirectory). Choose a location that is **excluded from cloud backups** — a key copied into iCloud/Google backups can be restored onto another device and impersonate the node. On Flutter, prefer the application support directory (`getApplicationSupportDirectory()`) over the documents directory and mark it excluded from backup (`NSURLIsExcludedFromBackupKey` on iOS; backup rules on Android). Calling `logout()` revokes the node key with the control plane before wiping local state.
+Persistent `up()` may omit the auth key on a fresh installation; upstream then
+returns `needsLogin` with an authorization URL for interactive enrollment.
+Supplying a key is the non-interactive path. Subsequent launches can omit it
+because the node identity is persisted in `stateDir`.
+
+Persistent nodes use one authenticated encrypted Go StateStore at
+`stateDir/tailscale/tailscaled.state.enc`. One random 32-byte data-encryption
+key (DEK) is stored in the dedicated Keybay namespace and retained in memory
+only for the runtime lifetime. Routine StateStore reads and writes do not call
+Keybay. Missing or unavailable custody, malformed or tampered ciphertext,
+unsafe permissions, and recognized pre-launch SQLite/FileStore layouts fail
+closed; legacy identities are not migrated.
+
+Only the logical Tailscale StateStore is encrypted by this mechanism. The
+package-owned `tailscale/` subtree can also contain upstream logs, log
+configuration, and TLS/certificate sidecars outside that encryption boundary.
+Keep those residuals owner-only and the entire `stateDir` private and excluded
+from backups. The persistent demo shows a fail-closed Apple resource-value
+readback and Android cloud/device-transfer exclusion rules for its exact state
+root; production embedders own the equivalent host policy.
+
+Calling `logout()` is remote-first: confirmed control-plane success removes
+the current logical profile, but the StateStore container and DEK remain.
+`forgetLocalIdentity()` is the explicit local-only reset: it stops any active
+runtime, records durable reset intent, deletes the exact DEK, and removes only
+the package-owned `tailscale/` subtree. It does not contact the control plane,
+so the remote node can remain until an administrator or expiry policy removes
+it.
 
 For short-lived CI jobs, preview environments, and disposable test nodes, pass
 `ephemeral: true` to register a node that Tailscale removes after it goes
@@ -103,29 +151,44 @@ await Tailscale.instance.up(
 );
 ```
 
-Use a fresh or cleared `stateDir` for each disposable identity. If `stateDir`
-already contains node credentials, `up(ephemeral: true)` reconnects as that
-existing node instead of registering a new ephemeral one.
+Ephemeral startup requires a non-empty auth key. It uses an in-memory
+StateStore and a fresh owner-only temporary runtime directory, removes that
+scratch directory on normal close, and never reads, writes, or deletes Keybay.
+It refuses to start if the configured persistent root contains recognized or
+unexpected package state; choose an empty `stateDir` rather than expecting
+ephemeral mode to reuse or clear a persistent identity.
+
+### Persistent-storage platform requirements
+
+- **iOS and macOS:** persistent nodes use Keybay's Keychain-backed custody.
+- **Android:** persistent nodes require Android 12 / API 31 or newer. Older
+  Android versions can use explicit ephemeral mode.
+- **Linux desktop:** persistent nodes require `secret-tool` and an available,
+  unlocked Secret Service collection. There is no supported Keybay custody
+  contract for headless Linux sessions, so headless services must use explicit
+  ephemeral mode.
+
+Persistent startup fails closed when these custody requirements are not met;
+there is no plaintext fallback.
 
 ## Feature support
 
 Area | API | Status | Notes
 --- | --- | --- | ---
-Lifecycle | `init`, `up`, `down`, `logout`, `status` | Supported | `up(ephemeral: true)` supports disposable CI/test nodes; `up()` resolves on the first stable state: running, needs login, or needs machine auth.
+Lifecycle | `init`, `up`, `down`, `logout`, `forgetLocalIdentity`, `status` | Supported | Persistent state uses one Keybay-custodied DEK and an encrypted Go StateStore. `up(ephemeral: true)` uses an in-memory store and no Keybay. `logout()` is remote-first and retains local storage; `forgetLocalIdentity()` is the explicit local-only destructive reset.
 Reactive state | `onStateChange`, `onError`, `onNodeChanges` | Supported | Go pushes updates to Dart; callers do not poll.
 Node identity | `nodes`, `nodeByIp`, `whois` | Supported | Use stable node IDs for durable references.
 Outbound HTTP | `http.client` | Supported | A normal `package:http` client routed through tsnet.
 Inbound HTTP | `http.bind` | Supported | Package-native request/response types backed by fd streams.
 Raw TCP | `tcp.dial`, `tcp.bind` | Supported | Explicit read/write halves and half-close.
 Raw UDP | `udp.bind` | Supported | Message-preserving datagrams with remote endpoint metadata.
-TLS listener | `tls.bind`, `tls.domains` | Supported | Requires MagicDNS and HTTPS enabled on the tailnet.
-Serve | `serve.forward`, `serve.clear` | Supported | Tailnet-only publication for an existing loopback HTTP server.
-Funnel | `funnel.forward`, `funnel.clear` | Supported | Public HTTPS publication through Tailscale Funnel policy.
+TLS listener | `tls.bind` | Desktop/server only | Requires MagicDNS and HTTPS. Upstream's certificate endpoint is disabled on iOS/Android, so mobile termination is explicitly unsupported; the package does not add a parallel certificate path.
+TLS discovery | `tls.domains` | Supported read-only API | Reads the runtime's advertised certificate domains directly; this does not provision a certificate or imply that `tls.bind` works on mobile.
+Serve | `serve.forward`, `serve.clear` | Desktop/server qualified | Tailnet publication through the runtime-owned ServeConfig manager. The R5 replacement/exact-handle and macOS persisted process-crash/restart receipts passed 2026-08-10; mobile HTTPS qualification remains pending.
+Funnel | `funnel.forward`, `funnel.clear` | Desktop/server qualified | The public-visibility mode of the same ServeConfig mapping used by Serve. Public ingress, tailnet reach, and the R5 swap receipt have passed hosted Tailscale; all mobile receipts remain pending.
 Tailscale Services | N/A | Planned | Upstream `tsnet.Server.ListenService` is available in the current pin; no Dart wrapper yet.
-Routing controls | `prefs`, `exitNode` | Supported | Subnet routes, Shields Up, tags, hostname, auto-update, and exit nodes.
-Diagnostics | `diag` | Supported | Ping, metrics, DERP map, and update checks.
-Taildrop | `taildrop` | Planned | Exported as a stub; not implemented in this release.
-Profiles | `profiles` | Planned | Exported as a stub; not implemented in this release.
+Routing controls | `prefs`, `exitNode` | Supported | Subnet routes, Shields Up, tags, and exit nodes. Hostname is configured through `up()` so lifecycle state stays coherent.
+Diagnostics | `diag` | Supported | Ping, metrics, DERP map, and advisory native-version checks. Embedded Tailscale is upgraded with the package or host application, not in place.
 Windows | N/A | Unsupported | v1 is POSIX-only while the Windows data-plane backend is designed.
 
 See [doc/api-status.md](https://github.com/danReynolds/tailscale_dart/blob/main/doc/api-status.md) for the full namespace-by-namespace API map.
@@ -137,7 +200,10 @@ A few canonical snippets below. The [developer site](https://danreynolds.github.
 All snippets assume the node has been initialized and started:
 
 ```dart
-Tailscale.init(stateDir: '/app/state');
+Tailscale.init(
+  stateDir: '/app/state',
+  appId: 'com.example.myapp',
+);
 await Tailscale.instance.up(authKey: 'tskey-auth-...');
 ```
 
@@ -172,7 +238,7 @@ server.requests.listen((request) async {
 
 ### Use Shelf middleware directly
 
-The tested adapter in [`example/shelf_adapter.dart`](example/shelf_adapter.dart)
+The tested adapter in [`example/shelf_adapter.dart`](https://github.com/danReynolds/tailscale_dart/blob/main/example/shelf_adapter.dart)
 adds a `bindShelf` extension for apps that want Shelf middleware and routing.
 Add `shelf` to your app and copy or import the adapter; `package:tailscale`
 does not take Shelf as a core dependency.
@@ -207,6 +273,11 @@ Future<void> main() async {
 Use `serve.forward` when your app already owns a local HTTP server and you want
 to publish that existing loopback port.
 
+The HTTPS example below is currently a desktop/server-qualified path. Mobile
+HTTPS Serve and ServeConfig Funnel still need their own real-device and sidecar
+receipts; `tls.bind` remains unsupported there with the upstream certificate
+endpoint omitted.
+
 ```dart
 final publication = await Tailscale.instance.serve.forward(
   tailnetPort: 443,
@@ -217,18 +288,24 @@ print('tailnet URL: ${publication.url}');
 ```
 
 `serve.forward` traffic follows Tailscale Serve semantics, including Tailscale
-identity headers for tailnet clients. `funnel.forward` follows the same local
-server shape for public Funnel publication, but Funnel traffic is public and does
-not include Tailscale identity headers.
+identity headers for tailnet clients. `funnel.forward` changes the same
+port/path publication to public Funnel visibility; it is not an independent
+listener. The latest call at that coordinate owns the handler, and exact
+publication handles cannot clear a replacement. Funnel traffic is public and
+does not include Tailscale identity headers.
+
+Funnel visibility is upstream host:port policy, not path policy. Enabling it on
+port 443 can expose every ServeConfig path on that port. Use a dedicated public
+port or authenticate all handlers that share it.
 
 ## Platform support
 
 Platform | Status | Notes
 --- | --- | ---
-iOS | Supported | Userspace tsnet, no VPN entitlement. Validated with the Flutter smoke app.
-Android | Supported | Userspace tsnet, no root. Validated with the Flutter smoke app.
+iOS | Core supported | Userspace tsnet, no VPN entitlement. Core lifecycle and private data-plane smoke validated; `tls.bind` is unsupported by the upstream mobile build, while HTTPS Serve and ServeConfig Funnel remain unqualified pending real-device receipts.
+Android | Core supported | Userspace tsnet, no root. Persistent nodes require Android 12 / API 31+; older versions can run explicitly ephemeral nodes. Core smoke is validated; `tls.bind` is unsupported by the upstream mobile build, while HTTPS Serve and ServeConfig Funnel remain unqualified pending real-device receipts.
 macOS | Supported | Native asset and kqueue reactor path validated locally.
-Linux | Supported | Native asset and epoll reactor path validated in Headscale E2E.
+Linux | Supported with storage qualification | Native asset and epoll reactor path validated in Headscale E2E. Persistent nodes require a desktop session with `secret-tool` and an available, unlocked Secret Service; headless Linux supports ephemeral nodes only.
 Windows | Unsupported | Excluded from the package platform list until a Windows-native backend is designed.
 
 The package is intentionally POSIX-first because owned transports use native descriptors plus a shared kqueue/epoll reactor. Windows needs a different transport backend rather than a thin port of the POSIX implementation.
@@ -236,28 +313,47 @@ The package is intentionally POSIX-first because owned transports use native des
 ## Runtime model
 
 ```
-Dart app
+Dart app / lifecycle supervisor
   |
   | typed API calls and streams
   v
-FFI worker isolate
+Replaceable FFI worker isolate
   |
-  | control ops + fd-backed data-plane handoff
+  | token-tagged control ops + fd-backed data-plane handoff
   v
-Go tsnet runtime
+Go nodeRuntime generation
   |
   | WireGuard, ACLs, MagicDNS, DERP
   v
 Tailnet peers
 ```
 
-Control-plane calls go through a worker isolate so Dart's main isolate does not block on native work. Runtime events come back through Dart ports as streams.
+Control-plane calls go through a worker isolate so Dart's main isolate does not
+block on native work. The caller isolate supervises that worker: every startup
+has a token known before dispatch, timeout or worker death quarantines only that
+generation, and replacement waits for native watcher/teardown joins. Runtime
+events carry the generation token back through Dart ports so stale pushes are
+dropped. Native `down`/`logout` receipts remain token-addressable until the
+caller receives them, so worker death cannot erase a completed result. A
+failed native cleanup is typed as `runtimeCleanupFailed` and blocks replacement
+for the rest of the process rather than guessing that teardown succeeded.
+
+Each runtime also owns one automatic, bounded first-`Up` bootstrap and one
+serialized ServeConfig publication manager. Public `running` and data-plane
+readiness are withheld until upstream's per-Server reset succeeds. A bootstrap
+failure quarantines that exact generation; Serve/Funnel mutations use bounded
+ETag retries and an indeterminate commit likewise closes the generation rather
+than returning without a trustworthy handle.
 
 Owned transports (`http.bind`, `tcp.bind`, `udp.bind`, `tls.bind`) use private fd-backed capabilities. That keeps listener ownership inside the package and avoids pretending that a localhost proxy is secure. Forwarding APIs (`serve.forward`, `funnel.forward`) intentionally use loopback because their purpose is to publish an existing local HTTP server the application already owns.
 
 ## Roadmap
 
-The core package path is implemented: lifecycle, node identity, HTTP, TCP, UDP, TLS, Serve/Funnel, prefs, exit nodes, diagnostics, Headscale E2E, and hosted-Tailscale live validation. Remaining launch and post-launch work is tracked in the design docs under [`doc/`](https://github.com/danReynolds/tailscale_dart/tree/main/doc) — see [Documentation](#documentation) for the index.
+The core private-tailnet package path is implemented. Before the next launch
+claim, the accepted [rearchitecture plan](https://github.com/danReynolds/tailscale_dart/blob/main/doc/rearchitecture-plan.md) aligns
+lifecycle ownership, auth semantics, Serve/Funnel behavior, encrypted node
+state, and platform evidence with current upstream Tailscale. Feature work
+outside that gate remains tracked in [the API roadmap](https://github.com/danReynolds/tailscale_dart/blob/main/doc/api-roadmap.md).
 
 ## Contributing
 
@@ -265,7 +361,7 @@ Issues, bug reports, and PRs are welcome.
 
 - **Found a bug or have a feature request?** [Open an issue](https://github.com/danReynolds/tailscale_dart/issues).
 - **Have a question or want to share what you're building?** [Start a discussion](https://github.com/danReynolds/tailscale_dart/discussions).
-- **Want to send a PR?** Run `dart analyze`, `dart test`, and `tool/test_pr_gate.sh` before pushing. The full test setup — including the Headscale E2E suite and opt-in live Tailscale runs — is documented in [test/README.md](https://github.com/danReynolds/tailscale_dart/blob/main/test/README.md).
+- **Want to send a PR?** Run `dart analyze`, `dart test --exclude-tags live-tailscale`, and `tool/test_pr_gate.sh` before pushing. The full test setup — including the Headscale E2E suite and opt-in live Tailscale runs — is documented in [test/README.md](https://github.com/danReynolds/tailscale_dart/blob/main/test/README.md).
 
 If you're using `package:tailscale` in production, I'd love to hear about it — open a discussion and let me know.
 

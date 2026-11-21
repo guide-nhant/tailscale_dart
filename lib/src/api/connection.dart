@@ -258,6 +258,11 @@ final class _FdTailscaleListener implements TailscaleListener {
       onResume: _drainPendingAccepts,
       onCancel: close,
     );
+    // `close()` can complete `done` with an error (e.g. worker death) and also
+    // rethrow it; callers that catch the throw but never await `done` would
+    // otherwise leak an unhandled async error. `ignore()` absorbs the orphaned
+    // completion while awaiters still observe it.
+    _done.future.ignore();
   }
 
   final int listenerId;
@@ -415,7 +420,12 @@ final class _FdTailscaleListener implements TailscaleListener {
         }
         _connections.add(connection);
       } catch (error, stackTrace) {
-        _connections.addError(error, stackTrace);
+        // Guard against a close() that raced this async adopt: addError on a
+        // closed controller throws inside this unawaited closure, surfacing as
+        // an uncaught async error. (The HTTP listener already guards this way.)
+        if (!_closed && !_connections.isClosed) {
+          _connections.addError(error, stackTrace);
+        }
       }
     }());
   }

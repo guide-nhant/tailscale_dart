@@ -11,6 +11,8 @@ import 'errors.dart';
 import 'fd_transport.dart';
 import 'ffi_bindings.dart' as native;
 import 'http_fd_protocol.dart';
+import 'native_offload_gate.dart';
+import 'native_error_code.dart';
 
 const int _responseHeadPrefixBytes = 4;
 
@@ -19,39 +21,126 @@ const int _responseHeadPrefixBytes = 4;
 /// Request and response bodies are streamed over private POSIX fd capabilities
 /// rather than a local TCP proxy.
 final class TailscaleHttpClient extends http.BaseClient {
+  TailscaleHttpClient({required this.runtimeToken});
+
+  /// Exact native runtime capability captured when this client was created.
+  final int runtimeToken;
+  bool _closed = false;
+  bool _nativeAdmissionReady = false;
+
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (_closed) {
+      throw http.ClientException(
+        'Tailscale HTTP client is closed.',
+        request.url,
+      );
+    }
     if (Platform.isWindows) {
       throw const TailscaleHttpException('Windows is not supported.');
     }
-    final start = _startNativeRequest(request);
-    late final PosixFdTransport responseTransport;
-    try {
-      responseTransport = await PosixFdTransport.adopt(start.responseBodyFd);
-    } catch (_) {
-      // `adopt` owns and closes the fd it was given on failure, so only the
-      // request fd (not yet adopted — it is written below) needs closing here.
-      // Closing responseBodyFd again would double-close it.
+    final nativeRequest = _NativeHttpRequest.fromRequest(request);
+    // The first admission can join the runtime's bounded first-Up bootstrap,
+    // so keep it off the caller isolate. A successful admission proves that
+    // this exact runtime's monotonic bootstrap is ready. Later admissions do
+    // only bounded local work before Go starts the network request in a
+    // goroutine, so avoid paying a fresh helper-isolate round trip on every
+    // steady request.
+    final start = _nativeAdmissionReady
+        ? _startNativeRequest(runtimeToken, nativeRequest)
+        : await runCappedNativeOffload(
+            () => _startNativeRequest(runtimeToken, nativeRequest),
+          );
+    _nativeAdmissionReady = true;
+    if (_closed) {
       closePosixFdForCleanup(start.requestBodyFd);
-      rethrow;
+      closePosixFdForCleanup(start.responseBodyFd);
+      throw http.ClientException(
+        'Tailscale HTTP client is closed.',
+        request.url,
+      );
     }
-
-    final bodyWriteDone = _writeRequestBody(
-      request.finalize(),
-      start.requestBodyFd,
+    return _sendOverFds(
+      requestBodyFd: start.requestBodyFd,
+      responseBodyFd: start.responseBodyFd,
+      request: request,
     );
+  }
 
-    final parsed = _HttpResponseParser(
+  @override
+  void close() {
+    _closed = true;
+  }
+}
+
+final class _NativeHttpRequest {
+  const _NativeHttpRequest({
+    required this.method,
+    required this.url,
+    required this.headersJson,
+    required this.contentLength,
+    required this.followRedirects,
+    required this.maxRedirects,
+  });
+
+  factory _NativeHttpRequest.fromRequest(http.BaseRequest request) =>
+      _NativeHttpRequest(
+        method: request.method,
+        url: request.url.toString(),
+        headersJson: jsonEncode({
+          for (final entry in request.headers.entries)
+            entry.key: <String>[entry.value],
+        }),
+        contentLength: request.contentLength ?? -1,
+        followRedirects: request.followRedirects,
+        maxRedirects: request.maxRedirects,
+      );
+
+  final String method;
+  final String url;
+  final String headersJson;
+  final int contentLength;
+  final bool followRedirects;
+  final int maxRedirects;
+}
+
+/// Drives [request] over the two native fds and returns the streamed response.
+///
+/// Owns both fds once called: [responseBodyFd] is adopted into a transport
+/// (which closes it itself on adopt-failure), and [requestBodyFd] is handed to
+/// [_writeRequestBody] (which adopts and closes it). A single cleanup path
+/// releases whatever is still owned if any step throws — ownership is tracked
+/// by the [requestFdTransferred] flag rather than by code position, so a future
+/// inserted step can't silently leak an fd (and pin the Go request goroutine).
+/// Mirrors the inbound accept path's cleanup shape in `api/http.dart`.
+Future<http.StreamedResponse> _sendOverFds({
+  required int requestBodyFd,
+  required int responseBodyFd,
+  required http.BaseRequest request,
+}) async {
+  PosixFdTransport? responseTransport;
+  var requestFdTransferred = false;
+  try {
+    // adopt closes responseBodyFd itself if it throws.
+    responseTransport = await PosixFdTransport.adopt(responseBodyFd);
+
+    // finalize() can throw (a re-sent request, or a custom BaseRequest
+    // override) before the request fd is adopted.
+    final requestBody = request.finalize();
+
+    // From here _writeRequestBody owns (adopts + closes) the request fd.
+    requestFdTransferred = true;
+    final bodyWriteDone = _writeRequestBody(requestBody, requestBodyFd);
+
+    return await _HttpResponseParser(
       responseTransport,
       request,
       bodyWriteDone,
-    );
-    try {
-      return await parsed.response;
-    } catch (_) {
-      await responseTransport.close();
-      rethrow;
-    }
+    ).response;
+  } catch (_) {
+    await responseTransport?.close();
+    if (!requestFdTransferred) closePosixFdForCleanup(requestBodyFd);
+    rethrow;
   }
 }
 
@@ -68,50 +157,91 @@ Future<http.StreamedResponse> parseHttpFdResponseForTesting({
   ).response;
 }
 
+/// Test seam over [_writeRequestBody]: streams [body] to [fd] chunk-by-chunk.
+/// Exposed so a regression test can prove the request body is transmitted
+/// incrementally rather than buffered in full before the first write.
+@visibleForTesting
+Future<void> writeRequestBodyForTesting(Stream<List<int>> body, int fd) =>
+    _writeRequestBody(body, fd);
+
+/// Test seam over [_sendOverFds]: drives the fd-owning core directly on
+/// caller-supplied fds, so a fault-injection test can prove both fds are
+/// released when a step (e.g. `request.finalize()`) throws.
+@visibleForTesting
+Future<http.StreamedResponse> sendOverFdsForTesting({
+  required int requestBodyFd,
+  required int responseBodyFd,
+  required http.BaseRequest request,
+}) => _sendOverFds(
+  requestBodyFd: requestBodyFd,
+  responseBodyFd: responseBodyFd,
+  request: request,
+);
+
 ({int requestBodyFd, int responseBodyFd}) _startNativeRequest(
-  http.BaseRequest request,
+  int runtimeToken,
+  _NativeHttpRequest request,
 ) {
   final methodPtr = request.method.toNativeUtf8();
-  final urlPtr = request.url.toString().toNativeUtf8();
-  final headersPtr = jsonEncode({
-    for (final entry in request.headers.entries)
-      entry.key: <String>[entry.value],
-  }).toNativeUtf8();
+  final urlPtr = request.url.toNativeUtf8();
+  final headersPtr = request.headersJson.toNativeUtf8();
 
   try {
-    final resultPtr = native.duneHttpStart(
-      methodPtr,
-      urlPtr,
-      headersPtr,
-      request.contentLength ?? -1,
-      request.followRedirects ? 1 : 0,
-      request.maxRedirects,
+    final parsed =
+        decodeNativeEnvelope(
+              () => native.duneHttpStart(
+                runtimeToken,
+                methodPtr,
+                urlPtr,
+                headersPtr,
+                request.contentLength,
+                request.followRedirects ? 1 : 0,
+                request.maxRedirects,
+              ),
+              onError: TailscaleHttpException.new,
+            )
+            as Map<String, dynamic>;
+
+    return validateNativeHttpFdsForTesting(
+      requestBodyFd: parsed['requestBodyFd'],
+      responseBodyFd: parsed['responseBodyFd'],
     );
-    final json = resultPtr.toDartString();
-    native.duneFree(resultPtr);
-
-    final parsed = jsonDecode(json) as Map<String, dynamic>;
-    final error = parsed['error'] as String?;
-    if (error != null) {
-      throw TailscaleHttpException(error);
-    }
-
-    final requestBodyFd = parsed['requestBodyFd'] as int?;
-    final responseBodyFd = parsed['responseBodyFd'] as int?;
-    if (requestBodyFd == null ||
-        requestBodyFd < -1 ||
-        responseBodyFd == null ||
-        responseBodyFd < 0) {
-      throw const TailscaleHttpException(
-        'Native runtime did not return usable HTTP fds.',
-      );
-    }
-    return (requestBodyFd: requestBodyFd, responseBodyFd: responseBodyFd);
   } finally {
     calloc.free(methodPtr);
     calloc.free(urlPtr);
     calloc.free(headersPtr);
   }
+}
+
+/// Validates and assumes ownership of the native HTTP fd pair.
+///
+/// Native is expected to return either `-1` for an absent request body or a
+/// non-negative request fd, plus a non-negative response fd. If that contract
+/// is violated after native has already created one usable descriptor, close
+/// every descriptor Dart can identify before surfacing the protocol error.
+@visibleForTesting
+({int requestBodyFd, int responseBodyFd}) validateNativeHttpFdsForTesting({
+  required Object? requestBodyFd,
+  required Object? responseBodyFd,
+  void Function(int) closeFd = closePosixFdForCleanup,
+}) {
+  if (requestBodyFd is int &&
+      requestBodyFd >= -1 &&
+      responseBodyFd is int &&
+      responseBodyFd >= 0) {
+    return (requestBodyFd: requestBodyFd, responseBodyFd: responseBodyFd);
+  }
+
+  final ownedFds = <int>{
+    if (requestBodyFd is int && requestBodyFd >= 0) requestBodyFd,
+    if (responseBodyFd is int && responseBodyFd >= 0) responseBodyFd,
+  };
+  for (final fd in ownedFds) {
+    closeFd(fd);
+  }
+  throw const TailscaleHttpException(
+    'Native runtime did not return usable HTTP fds.',
+  );
 }
 
 Future<void> _writeRequestBody(Stream<List<int>> body, int fd) async {
@@ -314,7 +444,13 @@ Map<String, String> _parseHeaders(Object? raw) {
   return {
     for (final entry in raw.entries)
       if (entry.key is String)
-        entry.key as String: switch (entry.value) {
+        // Lowercase the key: the Go side forwards `resp.Header` verbatim, whose
+        // keys are canonical-cased ("Content-Type"), but `package:http` looks
+        // headers up by their lowercase name (e.g. `Response.body` reads
+        // `headers['content-type']` to pick the charset). Without this a
+        // UTF-8 `application/json; charset=utf-8` body decodes as latin1, and
+        // any lowercase header lookup silently misses.
+        (entry.key as String).toLowerCase(): switch (entry.value) {
           final List<dynamic> values => values.join(', '),
           final String value => value,
           final Object value => value.toString(),

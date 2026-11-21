@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'src/backup_policy.dart';
+
 const _voidBlack = Color(0xff020706);
 const _terminal = Color(0xff061815);
 const _panel = Color(0xe6091815);
@@ -207,12 +209,14 @@ class _DemoHomePageState extends State<DemoHomePage> {
   }
 
   Future<void> _loadStateDir() async {
-    String path;
+    late final String path;
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      path = p.join(docs.path, 'tailscale_demo');
-    } catch (_) {
-      path = p.join(Directory.systemTemp.path, 'tailscale_demo');
+      final support = await getApplicationSupportDirectory();
+      path = p.join(support.path, 'tailscale_demo');
+      await preparePersistentStateDirectory(path);
+    } catch (error) {
+      _log('secure state directory unavailable: $error');
+      return;
     }
     if (!mounted) return;
     setState(() {
@@ -232,6 +236,7 @@ class _DemoHomePageState extends State<DemoHomePage> {
     }
     final status = await _demo.up(
       stateDir: stateDir,
+      appId: 'dev.tailscale.dart.demo.flutter',
       hostname: _hostname.text.trim(),
       authKey: authKey,
       controlUrl: controlUrl,
@@ -268,6 +273,7 @@ class _DemoHomePageState extends State<DemoHomePage> {
     setState(() => _services = null);
     final status = await _demo.upAsAdmin(
       stateDir: stateDir,
+      appId: 'dev.tailscale.dart.demo.flutter',
       hostname: _hostname.text.trim(),
       apiKey: _adminApiKey.text.trim(),
       tailnetId: _tailnetId.text.trim(),

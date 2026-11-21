@@ -13,6 +13,7 @@ final class PeerProcess {
 
   static Future<PeerProcess> spawn({
     required String stateDir,
+    required String appId,
     required String hostname,
     String? controlUrl,
     String? authKey,
@@ -22,13 +23,15 @@ final class PeerProcess {
   }) async {
     final process = await Process.start(
       Platform.resolvedExecutable,
-      ['run', '--enable-experiment=native-assets', 'test/e2e/peer_main.dart'],
+      ['run', 'test/e2e/peer_main.dart'],
       environment: {
         ...Platform.environment,
         'STATE_DIR': stateDir,
+        'APP_ID': appId,
         'HOSTNAME': hostname,
         'CONTROL_URL': ?controlUrl,
         'AUTH_KEY': ?authKey,
+        'TAILSCALE_TEST_KEYBAY_DIR': stateDir,
         if (ephemeral) 'EPHEMERAL': '1',
         'RESPONSE_BODY': ?responseBody,
         if (advertisedRoutes.isNotEmpty)

@@ -6,17 +6,32 @@ import 'dart:isolate';
 import 'dart:io' as io;
 
 import 'package:ffi/ffi.dart';
+import 'package:meta/meta.dart';
 
 import '../api/diag.dart';
 import '../api/connection.dart';
 import '../api/identity.dart';
 import '../api/prefs.dart';
+import '../api/serve.dart';
 import '../errors.dart';
 import '../ffi_bindings.dart' as native;
+import '../native_offload_gate.dart';
+import '../native_error_code.dart';
 import '../status.dart';
 
 part 'messages.dart';
 part 'entrypoint.dart';
+part 'native_offload.dart';
+
+/// Native disposition for an abandoned caller-isolate Keybay operation.
+enum StateCustodyDisposition { none, compensateKey, preserveCoherentPair }
+
+@visibleForTesting
+int remainingNativeBudgetMillis(Duration budget, Duration elapsed) {
+  final remaining = budget - elapsed;
+  if (remaining <= Duration.zero) return 0;
+  return remaining.inMilliseconds.clamp(0, 0x7fffffffffffffff);
+}
 
 Future<String> _loadHostNetworkSnapshot() async {
   if (!io.Platform.isAndroid) {
@@ -77,25 +92,190 @@ bool _isUsableHostAddress(io.InternetAddress address) {
   return false;
 }
 
+/// Encodes either a coordinate clear or an exact publication-handle close.
+///
+/// Omitting both identity fields is the public `serve.clear`/`funnel.clear`
+/// contract. Supplying both makes the mutation conditional on that exact
+/// runtime generation and mapping token. A partial or zero identity is never
+/// sent because native must not guess whether a destructive clear was meant.
+@visibleForTesting
+String encodeServeClearPayload({
+  required int tailnetPort,
+  required String path,
+  required bool funnel,
+  int? generation,
+  int? mappingToken,
+}) {
+  if ((generation == null) != (mappingToken == null)) {
+    throw ArgumentError(
+      'generation and mappingToken must be supplied together.',
+    );
+  }
+  if (generation != null && generation <= 0) {
+    throw RangeError.value(generation, 'generation', 'must be positive');
+  }
+  if (mappingToken != null && mappingToken <= 0) {
+    throw RangeError.value(mappingToken, 'mappingToken', 'must be positive');
+  }
+  final payload = <String, Object>{
+    'tailnetPort': tailnetPort,
+    'path': path,
+    'funnel': funnel,
+  };
+  if (generation != null) {
+    payload['generation'] = generation;
+    payload['mappingToken'] = mappingToken!;
+  }
+  return jsonEncode(payload);
+}
+
+@visibleForTesting
+bool acceptsRuntimePush({
+  required int token,
+  required int? currentToken,
+  required int? preparingToken,
+}) {
+  if (token <= 0) return false;
+  return token == currentToken ||
+      (currentToken == null && token == preparingToken);
+}
+
+/// Reserves lifecycle call order synchronously, before an operation reaches
+/// its first asynchronous preparation step.
+final class LifecycleQueue {
+  Future<void> _tail = Future<void>.value();
+
+  Future<T> run<T>(Future<T> Function() operation) {
+    final result = Completer<T>();
+    final previous = _tail;
+    final done = Completer<void>();
+    _tail = done.future;
+
+    unawaited(() async {
+      try {
+        await previous;
+        result.complete(await operation());
+      } catch (error, stackTrace) {
+        result.completeError(error, stackTrace);
+      } finally {
+        done.complete();
+      }
+    }());
+    return result.future;
+  }
+}
+
+/// Token-scoped handoff for fatal publication-bootstrap events.
+///
+/// A failure is retained only while an initiating `up()` has registered a
+/// waiter. Once that call settles, a later asynchronous failure is owned by the
+/// terminal event callback and must not leave an unbounded historical cache.
+@visibleForTesting
+final class PublicationBootstrapFailureRegistry {
+  final Map<int, Completer<TailscaleOperationException>> _waiters =
+      <int, Completer<TailscaleOperationException>>{};
+  final Map<int, TailscaleOperationException> _failures =
+      <int, TailscaleOperationException>{};
+
+  Future<TailscaleOperationException> waitFor(int token) {
+    final existing = _failures[token];
+    if (existing != null) {
+      return Future<TailscaleOperationException>.value(existing);
+    }
+    return _waiters
+        .putIfAbsent(token, Completer<TailscaleOperationException>.new)
+        .future;
+  }
+
+  TailscaleOperationException? failureFor(int token) => _failures[token];
+
+  Completer<TailscaleOperationException>? recordIfWaiting(
+    int token,
+    TailscaleOperationException failure,
+  ) {
+    final waiter = _waiters[token];
+    if (waiter == null) return null;
+    _failures[token] = failure;
+    return waiter;
+  }
+
+  void retire(int token) {
+    _waiters.remove(token);
+    _failures.remove(token);
+  }
+
+  @visibleForTesting
+  int get retainedFailureCount => _failures.length;
+}
+
+/// Test-only crash-injection points inside the supervised worker's lifecycle
+/// dispatch, armed through the `Tailscale.debugTerminateWorkerForTesting`
+/// wrapper. Each value names exactly one termination site.
+@visibleForTesting
+enum DebugTerminatePoint {
+  /// Immediately after the next down/logout intent is tagged and before its
+  /// native acknowledgement.
+  nextShutdown,
+
+  /// After the next native start response but before the public up operation
+  /// can complete its stable-state wait.
+  afterNextStart,
+
+  /// Immediately after the next logout command is sent to the worker, before
+  /// its native acknowledgement reaches Dart.
+  afterNextLogoutDispatch,
+
+  /// After native down/logout has produced a terminal receipt but before that
+  /// receipt can be delivered to the caller isolate.
+  afterNextLifecycleNativeResult,
+}
+
 /// The main isolate worker used by [Tailscale] to perform native Tailscale operations.
 final class Worker {
   Worker({
     required this.publishState,
     required this.publishRuntimeError,
     required this.publishNodes,
-  }) {
+    required this.onRuntimeTerminated,
+    required this.onExit,
+    @visibleForTesting void Function(SendPort)? debugEntrypoint,
+  }) : _entrypoint = debugEntrypoint ?? _workerEntrypoint {
     _start();
   }
 
   final void Function(NodeState state) publishState;
   final void Function(TailscaleRuntimeError error) publishRuntimeError;
   final void Function(List<TailscaleNode> nodes) publishNodes;
+  final void Function(
+    Worker worker,
+    int runtimeToken,
+    TailscaleOperationException failure,
+    bool emitStopped,
+    bool cleanupFailed,
+    bool reportRuntimeError,
+  )
+  onRuntimeTerminated;
+  final void Function(
+    Worker worker,
+    int? runtimeToken,
+    bool expected,
+    Object? cause,
+  )
+  onExit;
+  final void Function(SendPort) _entrypoint;
 
-  // Requests are processed synchronously on the worker isolate and each
-  // command produces exactly one response in request order, so a FIFO queue is
-  // sufficient for matching RPC responses without request IDs.
+  // Pending RPC responses, matched to their commands purely by FIFO position —
+  // the protocol carries no request IDs.
+  //
+  // INVARIANT: this pairing is sound only because the worker entrypoint
+  // handles each command synchronously, sending exactly one response per
+  // command in receipt order. Any `await` inside a command handler before its
+  // reply is sent breaks response pairing — a later command could then
+  // complete an earlier command's completer. Keep entrypoint handlers
+  // synchronous, or introduce tagged request IDs first.
   final Queue<Completer<_WorkerResponse>> _pendingRequests =
       Queue<Completer<_WorkerResponse>>();
+  final LifecycleQueue _lifecycle = LifecycleQueue();
 
   final _sendPortCompleter = Completer<SendPort>();
   final _receivePort = ReceivePort();
@@ -105,22 +285,40 @@ final class Worker {
   /// `_sendPort` points at a dead port, so requests must fail fast rather than
   /// send into the void and hang on a completer nothing will ever complete.
   bool _disposed = false;
+  bool _expectedExit = false;
+  bool _logoutDispatched = false;
+  final Set<DebugTerminatePoint> _armedDebugTerminations =
+      <DebugTerminatePoint>{};
+  Isolate? _isolate;
+  int? _runtimeToken;
+  int? _preparingToken;
+  int? _pushVisiblePreparingToken;
+  final PublicationBootstrapFailureRegistry _publicationBootstrapFailures =
+      PublicationBootstrapFailureRegistry();
+
+  int? get runtimeToken => _runtimeToken;
+  bool get isDisposed => _disposed;
 
   static const _workerTerminated = TailscaleOperationException(
     'worker',
     'Worker terminated.',
+    code: TailscaleErrorCode.workerTerminated,
   );
 
   Future<void> _start() async {
     _receivePort.listen(_handleWorkerMessage);
     try {
       final isolate = await Isolate.spawn<SendPort>(
-        _workerEntrypoint,
+        _entrypoint,
         _receivePort.sendPort,
+        // Register atomically with spawn. An isolate may exit before the
+        // Future returned by spawn completes, in which case a later
+        // addOnExitListener call is not guaranteed to receive an event.
+        onExit: _receivePort.sendPort,
       );
-      isolate.addOnExitListener(_receivePort.sendPort);
-    } catch (_) {
-      _dispose();
+      _isolate = isolate;
+    } catch (error) {
+      _dispose(cause: error);
     }
   }
 
@@ -134,20 +332,65 @@ final class Worker {
       case _WorkerReadyMessage(:final sendPort):
         _sendPortCompleter.complete(sendPort);
       case _WorkerBootstrapFailureMessage(:final message):
-        publishRuntimeError(
-          TailscaleRuntimeError(
-            message: message,
-            code: TailscaleRuntimeErrorCode.node,
+        _dispose(
+          cause: TailscaleOperationException(
+            'worker bootstrap',
+            message,
+            code: TailscaleErrorCode.workerTerminated,
           ),
         );
-        _dispose();
-      case _WorkerRuntimeErrorEvent(:final error):
+      case _WorkerRuntimeErrorEvent(:final runtimeToken, :final error):
+        if (!_acceptsPush(runtimeToken)) return;
         publishRuntimeError(error);
-      case _WorkerStateEvent(:final state):
+      case _WorkerRuntimeTerminatedEvent(
+        :final runtimeToken,
+        :final message,
+        :final code,
+        :final emitStopped,
+        :final cleanupFailed,
+        :final reportRuntimeError,
+      ):
+        if (!_acceptsPush(runtimeToken)) return;
+        final failure = TailscaleOperationException(
+          'native runtime',
+          message,
+          code: code,
+        );
+        detachRuntimeToken(runtimeToken);
+        final bootstrapWaiter =
+            code == TailscaleErrorCode.publicationBootstrapFailure
+            ? _publicationBootstrapFailures.recordIfWaiting(
+                runtimeToken,
+                failure,
+              )
+            : null;
+        onRuntimeTerminated(
+          this,
+          runtimeToken,
+          failure,
+          emitStopped,
+          cleanupFailed,
+          reportRuntimeError,
+        );
+        if (bootstrapWaiter != null && !bootstrapWaiter.isCompleted) {
+          bootstrapWaiter.complete(failure);
+        }
+      case _WorkerStateEvent(:final runtimeToken, :final state):
+        if (!_acceptsPush(runtimeToken)) return;
         publishState(state);
-      case _WorkerPeersEvent(:final peers):
+      case _WorkerPeersEvent(:final runtimeToken, :final peers):
+        if (!_acceptsPush(runtimeToken)) return;
         publishNodes(peers);
       case _WorkerResponse():
+        if (message
+            case _WorkerAckResponse(:final operation, :final runtimeToken)
+            when operation == _WorkerOperation.down ||
+                operation == _WorkerOperation.logout) {
+          // The caller isolate has now received the terminal disposition. The
+          // native receipt must remain live until this exact boundary so a
+          // worker exit before delivery can recover the same result.
+          native.duneAcknowledgeLifecycle(runtimeToken);
+        }
         // FIFO invariant: exactly one response per command, in order. Guard
         // against a stray/extra response so an invariant violation surfaces as
         // a dropped message rather than an unhandled throw in this listener.
@@ -156,12 +399,21 @@ final class Worker {
     }
   }
 
-  void _dispose() {
+  bool _acceptsPush(int token) {
+    return acceptsRuntimePush(
+      token: token,
+      currentToken: _runtimeToken,
+      preparingToken: _pushVisiblePreparingToken,
+    );
+  }
+
+  void _dispose({Object? cause}) {
     if (_disposed) return;
     _disposed = true;
-    native.duneStopWatch();
+    _isolate = null;
+    // Stop publishing to the dead isolate immediately. Runtime teardown and
+    // watcher join belong to the token-qualified supervisor rescue path.
     native.duneSetDartPort(0);
-    native.duneStop();
     _receivePort.close();
 
     if (!_sendPortCompleter.isCompleted) {
@@ -171,119 +423,168 @@ final class Worker {
       c.completeError(_workerTerminated);
     }
     _pendingRequests.clear();
+    onExit(this, _runtimeToken ?? _preparingToken, _expectedExit, cause);
+  }
+
+  /// Test seam for the expected/unexpected worker-exit supervisor paths.
+  @internal
+  void debugTerminate({bool expected = false}) {
+    _expectedExit = expected;
+    _isolate?.kill(priority: Isolate.immediate);
+  }
+
+  @internal
+  Future<void> debugWaitUntilReady() async {
+    await _sendPort;
+  }
+
+  /// Arms one test-only termination at [point]'s exact lifecycle injection
+  /// site. Each armed point fires once, on the next matching call.
+  @internal
+  void debugArmTermination(DebugTerminatePoint point) {
+    _armedDebugTerminations.add(point);
+  }
+
+  void _terminateForDebugIfRequested() {
+    if (!_armedDebugTerminations.remove(DebugTerminatePoint.nextShutdown)) {
+      return;
+    }
+    _isolate?.kill(priority: Isolate.immediate);
+  }
+
+  void detachRuntimeToken(int token) {
+    if (_runtimeToken == token) _runtimeToken = null;
+    if (_preparingToken == token) _preparingToken = null;
+    if (_pushVisiblePreparingToken == token) {
+      _pushVisiblePreparingToken = null;
+    }
+  }
+
+  Future<TailscaleOperationException> publicationBootstrapFailureFor(
+    int token,
+  ) => _publicationBootstrapFailures.waitFor(token);
+
+  void retirePublicationBootstrapFailure(int token) {
+    _publicationBootstrapFailures.retire(token);
   }
 
   Future<TResponse> _request<TResponse extends _WorkerResponse>(
-    _WorkerCommand request,
-  ) async {
-    if (_disposed) throw _workerTerminated;
-    final sendPort = await _sendPort;
-    // The worker may have died while we awaited the (already-completed)
-    // send port; if so the port is dead and a send would be silently dropped,
-    // leaving the completer below to hang forever. Fail fast instead.
-    if (_disposed) throw _workerTerminated;
-    final completer = Completer<_WorkerResponse>();
-    _pendingRequests.addLast(completer);
+    _WorkerCommand request, {
+    void Function()? afterSend,
+  }) async {
     try {
+      if (_disposed) throw _workerTerminated;
+      final sendPort = await _sendPort;
+      // The worker may have died while we awaited the (already-completed)
+      // send port; if so the port is dead and a send would be silently dropped,
+      // leaving the completer below to hang forever. Fail fast instead.
+      if (_disposed) throw _workerTerminated;
+      final completer = Completer<_WorkerResponse>();
+      _pendingRequests.addLast(completer);
       sendPort.send(request);
-      final response = await completer.future;
-      if (response is _WorkerFailureResponse) {
-        throw response.operation.exceptionForMessage(
-          response.message,
-          code: response.code,
-          statusCode: response.statusCode,
+      afterSend?.call();
+      try {
+        final response = await completer.future;
+        if (response is _WorkerFailureResponse) {
+          throw response.operation.exceptionForMessage(
+            response.message,
+            code: response.code,
+            statusCode: response.statusCode,
+          );
+        }
+        return response as TResponse;
+      } finally {
+        _pendingRequests.remove(completer);
+      }
+    } on TailscaleOperationException catch (error) {
+      if (error.code == TailscaleErrorCode.workerTerminated) {
+        throw request.operation.exceptionForMessage(
+          error.message,
+          code: error.code,
+          statusCode: error.statusCode,
         );
       }
-      return response as TResponse;
-    } catch (error) {
-      _pendingRequests.remove(completer);
       rethrow;
     }
   }
 
-  Future<void> start({
+  Future<WorkerStartResult> start({
+    required int requestToken,
     required String hostname,
     required String authKey,
     required bool ephemeral,
     required String controlUrl,
-    required String stateDir,
-  }) async {
-    final hostNetworkSnapshot = await _loadHostNetworkSnapshot();
-    await _request<_WorkerStartResponse>(
-      _WorkerStartCommand(
-        hostname: hostname,
-        authKey: authKey,
-        ephemeral: ephemeral,
-        controlUrl: controlUrl,
-        stateDir: stateDir,
-        hostNetworkSnapshot: hostNetworkSnapshot,
-      ),
-    );
+    required Duration bootstrapBudget,
+  }) {
+    _preparingToken = requestToken;
+    _pushVisiblePreparingToken = requestToken;
+    final budgetElapsed = Stopwatch()..start();
+    return _lifecycle.run(() async {
+      try {
+        final hostNetworkSnapshot = await _loadHostNetworkSnapshot();
+        if (_preparingToken != requestToken) {
+          throw const TailscaleUpException(
+            'Native startup was abandoned before dispatch.',
+            code: TailscaleErrorCode.startupAbandoned,
+          );
+        }
+        final response = await _request<_WorkerStartResponse>(
+          _WorkerStartCommand(
+            requestToken: requestToken,
+            hostname: hostname,
+            authKey: authKey,
+            ephemeral: ephemeral,
+            controlUrl: controlUrl,
+            hostNetworkSnapshot: hostNetworkSnapshot,
+            bootstrapBudgetMillis: remainingNativeBudgetMillis(
+              bootstrapBudget,
+              budgetElapsed.elapsed,
+            ),
+          ),
+        );
+        final bootstrapFailure = _publicationBootstrapFailures.failureFor(
+          response.runtimeToken,
+        );
+        if (bootstrapFailure != null) {
+          throw TailscaleUpException(
+            bootstrapFailure.message,
+            code: bootstrapFailure.code,
+            cause: bootstrapFailure,
+          );
+        }
+        if (_preparingToken != requestToken) {
+          throw const TailscaleUpException(
+            'Native startup completed after its request was abandoned.',
+            code: TailscaleErrorCode.startupAbandoned,
+          );
+        }
+        _runtimeToken = response.runtimeToken;
+        if (_armedDebugTerminations.remove(
+          DebugTerminatePoint.afterNextStart,
+        )) {
+          _isolate?.kill(priority: Isolate.immediate);
+        }
+        return WorkerStartResult(
+          alreadyActive: response.alreadyActive,
+          runtimeToken: response.runtimeToken,
+        );
+      } finally {
+        if (_preparingToken == requestToken) _preparingToken = null;
+        if (_pushVisiblePreparingToken == requestToken) {
+          _pushVisiblePreparingToken = null;
+        }
+      }
+    });
   }
 
-  Future<({int bindingId, TailscaleEndpoint tailnet})> httpBind({
-    required int tailnetPort,
-  }) async {
-    final response = await _request<_WorkerHttpBindResponse>(
-      _WorkerHttpBindCommand(tailnetPort: tailnetPort),
-    );
-    return (
-      bindingId: response.bindingId,
-      tailnet: TailscaleEndpoint(
-        address: response.tailnetAddress,
-        port: response.tailnetPort,
-      ),
-    );
-  }
+  /// Marks the initiating public up call settled before its Future returns.
+  /// A later first Running observation then receives a fresh 30-second
+  /// bootstrap budget instead of inheriting the completed call's deadline.
+  void markUpSettled(int token) => native.duneMarkUpSettled(token);
 
   Future<void> httpCloseBinding({required int bindingId}) async {
     await _request<_WorkerAckResponse>(
       _WorkerHttpCloseBindingCommand(bindingId: bindingId),
-    );
-  }
-
-  Future<({int fd, TailscaleEndpoint local, TailscaleEndpoint remote})>
-  tcpDialConnection({
-    required String host,
-    required int port,
-    Duration? timeout,
-  }) async {
-    final response = await _request<_WorkerTcpDialFdResponse>(
-      _WorkerTcpDialFdCommand(
-        host: host,
-        port: port,
-        timeoutMillis: timeout?.inMilliseconds ?? 0,
-      ),
-    );
-    return (
-      fd: response.fd,
-      local: TailscaleEndpoint(
-        address: response.localAddress,
-        port: response.localPort,
-      ),
-      remote: TailscaleEndpoint(
-        address: response.remoteAddress,
-        port: response.remotePort,
-      ),
-    );
-  }
-
-  Future<({int listenerId, TailscaleEndpoint local})> tcpListenFd({
-    required int tailnetPort,
-    required String tailnetHost,
-  }) async {
-    final response = await _request<_WorkerTcpListenFdResponse>(
-      _WorkerTcpListenFdCommand(
-        tailnetPort: tailnetPort,
-        tailnetHost: tailnetHost,
-      ),
-    );
-    return (
-      listenerId: response.listenerId,
-      local: TailscaleEndpoint(
-        address: response.localAddress,
-        port: response.localPort,
-      ),
     );
   }
 
@@ -293,38 +594,9 @@ final class Worker {
     );
   }
 
-  Future<({int listenerId, TailscaleEndpoint local})> tlsListenFd({
-    required int tailnetPort,
-    required String tailnetHost,
-  }) async {
-    final response = await _request<_WorkerTlsListenFdResponse>(
-      _WorkerTlsListenFdCommand(
-        tailnetPort: tailnetPort,
-        tailnetHost: tailnetHost,
-      ),
-    );
-    return (
-      listenerId: response.listenerId,
-      local: TailscaleEndpoint(
-        address: response.localAddress,
-        port: response.localPort,
-      ),
-    );
-  }
-
-  Future<({int fd, TailscaleEndpoint local})> udpBindFd({
-    required String host,
-    required int port,
-  }) async {
-    final response = await _request<_WorkerUdpBindFdResponse>(
-      _WorkerUdpBindFdCommand(host: host, port: port),
-    );
-    return (
-      fd: response.fd,
-      local: TailscaleEndpoint(
-        address: response.localAddress,
-        port: response.localPort,
-      ),
+  Future<void> udpCloseBinding({required int bindingId}) async {
+    await _request<_WorkerAckResponse>(
+      _WorkerUdpCloseBindingCommand(bindingId: bindingId),
     );
   }
 
@@ -340,21 +612,6 @@ final class Worker {
       const _WorkerTlsDomainsCommand(),
     );
     return response.domains;
-  }
-
-  Future<PingResult> diagPing({
-    required String ip,
-    Duration? timeout,
-    required String pingType,
-  }) async {
-    final response = await _request<_WorkerDiagPingResponse>(
-      _WorkerDiagPingCommand(
-        ip: ip,
-        timeoutMillis: timeout?.inMilliseconds ?? 0,
-        pingType: pingType,
-      ),
-    );
-    return response.result;
   }
 
   Future<String> diagMetrics() async {
@@ -378,9 +635,16 @@ final class Worker {
     return response.clientVersion;
   }
 
-  Future<TailscaleStatus> status({required String stateDir}) async {
+  Future<NodeStateSnapshot> debugNodeState() async {
+    final response = await _request<_WorkerDebugNodeStateResponse>(
+      const _WorkerDebugNodeStateCommand(),
+    );
+    return response.snapshot;
+  }
+
+  Future<TailscaleStatus> status() async {
     final response = await _request<_WorkerStatusResponse>(
-      _WorkerStatusCommand(stateDir: stateDir),
+      const _WorkerStatusCommand(),
     );
     return response.status;
   }
@@ -417,69 +681,193 @@ final class Worker {
     await _request<_WorkerAckResponse>(const _WorkerExitNodeUseAutoCommand());
   }
 
-  Future<
-    ({
-      Uri url,
-      int port,
-      String localAddress,
-      int localPort,
-      String path,
-      bool https,
-      bool funnel,
-    })
-  >
-  serveForward({
-    required int tailnetPort,
-    required int localPort,
-    required String localAddress,
-    required String path,
-    required bool https,
-    required bool funnel,
-  }) async {
-    final payload = jsonEncode({
-      'tailnetPort': tailnetPort,
-      'localPort': localPort,
-      'localAddress': localAddress,
-      'path': path,
-      'https': https,
-      'funnel': funnel,
-    });
-    final response = await _request<_WorkerServePublicationResponse>(
-      _WorkerServeForwardCommand(payloadJson: payload, funnel: funnel),
-    );
-    return (
-      url: response.url,
-      port: response.port,
-      localAddress: response.localAddress,
-      localPort: response.localPort,
-      path: response.path,
-      https: response.https,
-      funnel: response.funnel,
-    );
-  }
-
   Future<void> serveClear({
     required int tailnetPort,
     required String path,
     required bool funnel,
   }) async {
-    final payload = jsonEncode({
-      'tailnetPort': tailnetPort,
-      'path': path,
-      'funnel': funnel,
-    });
+    final payload = encodeServeClearPayload(
+      tailnetPort: tailnetPort,
+      path: path,
+      funnel: funnel,
+    );
     await _request<_WorkerAckResponse>(
       _WorkerServeClearCommand(payloadJson: payload, funnel: funnel),
     );
   }
 
-  Future<void> down() async {
-    await _request<_WorkerAckResponse>(const _WorkerDownCommand());
-  }
-
-  Future<void> logout(String stateDir) async {
+  /// Conditionally removes the mapping owned by one publication handle.
+  ///
+  /// Unlike [serveClear], native treats a stale generation or replaced mapping
+  /// token as an idempotent no-op. This is also the path used by publication
+  /// finalizers.
+  Future<void> serveClose({
+    required int tailnetPort,
+    required String path,
+    required bool funnel,
+    required int generation,
+    required int mappingToken,
+  }) async {
+    final payload = encodeServeClearPayload(
+      tailnetPort: tailnetPort,
+      path: path,
+      funnel: funnel,
+      generation: generation,
+      mappingToken: mappingToken,
+    );
     await _request<_WorkerAckResponse>(
-      _WorkerLogoutCommand(stateDir: stateDir),
+      _WorkerServeClearCommand(payloadJson: payload, funnel: funnel),
     );
   }
+
+  Future<WorkerCloseResult> down() {
+    final token = _runtimeToken ?? 0;
+    final terminateAfterNativeResult = _armedDebugTerminations.remove(
+      DebugTerminatePoint.afterNextLifecycleNativeResult,
+    );
+    _expectedExit = token > 0;
+    _terminateForDebugIfRequested();
+    return _lifecycle.run(() async {
+      try {
+        final response = await _request<_WorkerAckResponse>(
+          _WorkerDownCommand(
+            runtimeToken: token,
+            terminateAfterNativeResult: terminateAfterNativeResult,
+          ),
+        );
+        if (response.matched && _runtimeToken == token) {
+          _runtimeToken = null;
+        }
+        final errorMessage = response.errorMessage;
+        return WorkerCloseResult(
+          runtimeToken: response.runtimeToken,
+          matched: response.matched,
+          started: response.started,
+          emitStopped: response.emitStopped,
+          noState: response.noState,
+          cleanupFailed: response.cleanupFailed,
+          error: errorMessage == null
+              ? null
+              : TailscaleOperationException(
+                  'down',
+                  errorMessage,
+                  code: response.errorCode,
+                  statusCode: response.statusCode,
+                ),
+        );
+      } finally {
+        if (!_disposed) _expectedExit = false;
+      }
+    });
+  }
+
+  Future<WorkerCloseResult> logout({required int requestToken}) {
+    final token = _runtimeToken ?? requestToken;
+    _preparingToken = token;
+    _expectedExit = token > 0;
+    _terminateForDebugIfRequested();
+    return _lifecycle.run(() async {
+      try {
+        final hostNetworkSnapshot = await _loadHostNetworkSnapshot();
+        if (_preparingToken != token) {
+          throw const TailscaleLogoutException(
+            'Logout runtime preparation was abandoned before dispatch.',
+            code: TailscaleErrorCode.startupAbandoned,
+          );
+        }
+        final terminateAfterDispatch = _armedDebugTerminations.remove(
+          DebugTerminatePoint.afterNextLogoutDispatch,
+        );
+        final terminateAfterNativeResult = _armedDebugTerminations.remove(
+          DebugTerminatePoint.afterNextLifecycleNativeResult,
+        );
+        final response = await _request<_WorkerAckResponse>(
+          _WorkerLogoutCommand(
+            runtimeToken: token,
+            hostNetworkSnapshot: hostNetworkSnapshot,
+            terminateAfterNativeResult: terminateAfterNativeResult,
+          ),
+          afterSend: () {
+            // Set this only after SendPort.send returns. A worker failure while
+            // waiting for its port is known not to have reached native logout
+            // and must remain workerTerminated, not logoutIndeterminate.
+            _logoutDispatched = true;
+            if (terminateAfterDispatch) {
+              _isolate?.kill(priority: Isolate.immediate);
+            }
+          },
+        );
+        if ((response.started || response.noState) && _runtimeToken == token) {
+          _runtimeToken = null;
+        }
+        final errorMessage = response.errorMessage;
+        return WorkerCloseResult(
+          runtimeToken: response.runtimeToken,
+          matched: response.matched,
+          started: response.started,
+          emitStopped: response.emitStopped,
+          noState: response.noState,
+          cleanupFailed: response.cleanupFailed,
+          error: errorMessage == null
+              ? null
+              : TailscaleLogoutException(
+                  errorMessage,
+                  code: response.errorCode,
+                  statusCode: response.statusCode,
+                ),
+        );
+      } on TailscaleLogoutException catch (error) {
+        if (error.code == TailscaleErrorCode.workerTerminated &&
+            _logoutDispatched) {
+          throw TailscaleLogoutException(
+            'The worker terminated after logout dispatch; the remote result '
+            'is indeterminate.',
+            code: TailscaleErrorCode.logoutIndeterminate,
+            cause: error,
+          );
+        }
+        if (error.code == TailscaleErrorCode.logoutIndeterminate &&
+            _runtimeToken == token) {
+          _runtimeToken = null;
+        }
+        rethrow;
+      } finally {
+        if (_preparingToken == token) _preparingToken = null;
+        if (!_disposed) {
+          _expectedExit = false;
+          _logoutDispatched = false;
+        }
+      }
+    });
+  }
+}
+
+final class WorkerStartResult {
+  const WorkerStartResult({
+    required this.alreadyActive,
+    required this.runtimeToken,
+  });
+
+  final bool alreadyActive;
+  final int runtimeToken;
+}
+
+final class WorkerCloseResult {
+  const WorkerCloseResult({
+    required this.runtimeToken,
+    required this.matched,
+    required this.started,
+    required this.emitStopped,
+    required this.noState,
+    required this.cleanupFailed,
+    required this.error,
+  });
+
+  final int runtimeToken;
+  final bool matched;
+  final bool started;
+  final bool emitStopped;
+  final bool noState;
+  final bool cleanupFailed;
+  final TailscaleOperationException? error;
 }

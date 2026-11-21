@@ -239,11 +239,13 @@ class DERPNode {
   String toString() => 'DERPNode(name: $name, hostName: $hostName)';
 }
 
-/// An available client-version update (result of [Diag.checkUpdate]).
+/// An advisory upstream client-version update (result of [Diag.checkUpdate]).
 ///
 /// Mirrors `tailcfg.ClientVersion`. [Diag.checkUpdate] returns null
 /// when the node is already on the latest version, so the fields
-/// here always describe a concrete update to apply.
+/// here describe a newer native Tailscale version. The embedded runtime cannot
+/// replace itself; callers update it by upgrading this Dart package or the host
+/// application version that bundles it.
 @immutable
 class ClientVersion {
   const ClientVersion({
@@ -255,7 +257,8 @@ class ClientVersion {
   /// The newer version available for this platform (e.g. `1.94.1`).
   final String latestVersion;
 
-  /// When true, the update includes a security fix — apply promptly.
+  /// When true, the newer upstream version includes a security fix. Upgrade
+  /// the package or host application promptly.
   final bool urgentSecurityUpdate;
 
   /// Optional human-readable notification text from the control
@@ -280,11 +283,72 @@ class ClientVersion {
       'urgentSecurityUpdate: $urgentSecurityUpdate)';
 }
 
+/// Point-in-time census of the native runtime's internal registries.
+///
+/// For leak diagnostics and bug reports: after closing everything, all counts
+/// should be zero. Counts are each read under their own lock but the snapshot
+/// is not atomic across registries. Field set is diagnostic, not API-stable.
+final class NodeStateSnapshot {
+  const NodeStateSnapshot({
+    required this.epoch,
+    required this.servePublications,
+    required this.httpBindings,
+    required this.tcpListeners,
+    required this.udpBridges,
+    required this.transportCached,
+  });
+
+  /// Node lifecycle generation; increments on every stop/teardown.
+  final int epoch;
+
+  /// Live package-owned ServeConfig paths, including Funnel publications.
+  final int servePublications;
+
+  /// Live tailnet HTTP server bindings.
+  final int httpBindings;
+
+  /// Live tailnet TCP listeners.
+  final int tcpListeners;
+
+  /// Live UDP socketpair bridges.
+  final int udpBridges;
+
+  /// Whether the pooled tailnet HTTP client transport is currently cached.
+  final bool transportCached;
+
+  @override
+  bool operator ==(Object other) =>
+      other is NodeStateSnapshot &&
+      epoch == other.epoch &&
+      servePublications == other.servePublications &&
+      httpBindings == other.httpBindings &&
+      tcpListeners == other.tcpListeners &&
+      udpBridges == other.udpBridges &&
+      transportCached == other.transportCached;
+
+  @override
+  int get hashCode => Object.hash(
+    epoch,
+    servePublications,
+    httpBindings,
+    tcpListeners,
+    udpBridges,
+    transportCached,
+  );
+
+  @override
+  String toString() =>
+      'NodeStateSnapshot(epoch: $epoch, serve: $servePublications, '
+      'http: $httpBindings, tcp: $tcpListeners, udp: $udpBridges, '
+      'transportCached: $transportCached)';
+}
+
 typedef DiagPingFn =
     Future<PingResult> Function(String ip, Duration? timeout, PingType type);
 typedef DiagMetricsFn = Future<String> Function();
 typedef DiagDERPMapFn = Future<DERPMap> Function();
 typedef DiagCheckUpdateFn = Future<ClientVersion?> Function();
+typedef DiagNodeStateFn = Future<NodeStateSnapshot> Function();
 
 /// Observability and diagnostics. All read-only; nothing here affects
 /// connectivity.
@@ -309,9 +373,19 @@ abstract class Diag {
   /// map for this node.
   Future<DERPMap> derpMap();
 
-  /// Checks whether a newer version of the embedded tsnet runtime is
-  /// available. Returns null when already on the latest.
+  /// Checks whether upstream reports a newer native Tailscale version.
+  ///
+  /// Returns null when already on the latest. This is advisory: the embedded
+  /// runtime cannot self-update, so callers must upgrade the Dart package or
+  /// host application that bundles it.
   Future<ClientVersion?> checkUpdate();
+
+  /// Census of the native runtime's internal registries — live listener,
+  /// binding, and forwarder counts plus the teardown epoch.
+  ///
+  /// Intended for leak diagnostics and bug reports; after closing every
+  /// listener/binding the counts should all be zero.
+  Future<NodeStateSnapshot> nodeState();
 }
 
 /// Library-internal factory. Reach via `Tailscale.instance.diag`.
@@ -321,15 +395,23 @@ Diag createDiag({
   required DiagMetricsFn metricsFn,
   required DiagDERPMapFn derpMapFn,
   required DiagCheckUpdateFn checkUpdateFn,
-}) => _Diag(pingFn, metricsFn, derpMapFn, checkUpdateFn);
+  required DiagNodeStateFn nodeStateFn,
+}) => _Diag(pingFn, metricsFn, derpMapFn, checkUpdateFn, nodeStateFn);
 
 final class _Diag implements Diag {
-  _Diag(this._ping, this._metrics, this._derpMap, this._checkUpdate);
+  _Diag(
+    this._ping,
+    this._metrics,
+    this._derpMap,
+    this._checkUpdate,
+    this._nodeState,
+  );
 
   final DiagPingFn _ping;
   final DiagMetricsFn _metrics;
   final DiagDERPMapFn _derpMap;
   final DiagCheckUpdateFn _checkUpdate;
+  final DiagNodeStateFn _nodeState;
 
   @override
   Future<PingResult> ping(
@@ -346,4 +428,7 @@ final class _Diag implements Diag {
 
   @override
   Future<ClientVersion?> checkUpdate() => _checkUpdate();
+
+  @override
+  Future<NodeStateSnapshot> nodeState() => _nodeState();
 }

@@ -20,9 +20,9 @@ import 'dart:io';
 import 'package:tailscale/tailscale.dart';
 import 'package:test/test.dart';
 
-import '../e2e/support/native_asset_workaround.dart';
 import '../e2e/support/peer_process.dart';
 import '../e2e/support/state_waiters.dart';
+import '../integration/support/process_state_root.dart';
 import 'support/tailscale_api.dart';
 
 const _defaultRoutes = ['0.0.0.0/0', '::/0'];
@@ -77,7 +77,7 @@ void main() {
     }
     try {
       final dir = clientStateDir;
-      if (dir != null) Directory(dir).deleteSync(recursive: true);
+      if (dir != null) clearProcessIntegrationState(Directory(dir));
     } catch (_) {}
     try {
       final dir = exitStateDir;
@@ -149,14 +149,11 @@ Future<void> _setUpLiveTailnet({
   required void Function(PeerProcess peer) onExitPeer,
   required Set<String> deviceIdsToDelete,
 }) async {
-  await warmUpNativeAssetForPeerSubprocesses();
-  await detachLoadedNativeAssetForPeerSubprocesses();
-
   final api = LiveTailscaleApi(apiKey: apiKey, tailnetId: tailnetId);
   onApi(api);
-  final clientStateDir = Directory.systemTemp
-      .createTempSync('tailscale_live_client_')
-      .path;
+  final processStateRoot = processIntegrationStateRoot();
+  clearProcessIntegrationState(processStateRoot);
+  final clientStateDir = processStateRoot.path;
   final exitStateDir = Directory.systemTemp
       .createTempSync('tailscale_live_exit_')
       .path;
@@ -166,7 +163,7 @@ Future<void> _setUpLiveTailnet({
   final clientAuthKey = await api.createAuthKey();
   final exitAuthKey = await api.createAuthKey();
 
-  Tailscale.init(stateDir: clientStateDir);
+  Tailscale.init(stateDir: clientStateDir, appId: processIntegrationAppId);
   final tsnet = Tailscale.instance;
   onTailscale(tsnet);
   await recordUntil(
@@ -180,9 +177,9 @@ Future<void> _setUpLiveTailnet({
       timeout: const Duration(seconds: 120),
     ),
   );
-
   final exitPeer = await PeerProcess.spawn(
     stateDir: exitStateDir,
+    appId: 'dev.tailscale.dart.live.routing.exit',
     controlUrl: controlUri()?.toString(),
     authKey: exitAuthKey,
     ephemeral: true,

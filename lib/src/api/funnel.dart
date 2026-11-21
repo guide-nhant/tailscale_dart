@@ -1,9 +1,10 @@
-import 'dart:io' show InternetAddress, Platform;
+import 'dart:io' show Platform;
 
 import 'package:meta/meta.dart';
 
 import '../errors.dart';
 import 'serve.dart';
+import 'serve_validation.dart';
 
 /// Public-internet publication for an existing local HTTP service.
 ///
@@ -16,13 +17,27 @@ import 'serve.dart';
 /// the node must have the Funnel node attribute, and the requested port must be
 /// allowed by policy.
 ///
+/// Upstream Funnel visibility is scoped to the whole MagicDNS host and port,
+/// not one path. Enabling Funnel on a port can make every ServeConfig handler
+/// on that port publicly reachable. Prefer a dedicated public port or
+/// authenticate every handler sharing it.
+///
+/// Serve and Funnel are two visibility modes of one upstream ServeConfig
+/// publication authority. Publishing Funnel at the same port and path as an
+/// existing Serve mapping replaces that mapping; it does not create an
+/// independent listener or package reverse proxy.
+///
+/// The ServeConfig implementation is currently qualified only on
+/// desktop/server platforms. Do not infer iOS or Android support until the
+/// real-device HTTPS and persistent-sidecar inventory receipts pass.
+///
 /// Unlike [Serve.forward], public Funnel requests do not include Tailscale
 /// identity headers. Authenticate public callers at the forwarded service layer
 /// if the endpoint is not intentionally anonymous.
 ///
 /// Funnel publications are process-scoped in this package. Close returned
-/// handles explicitly; `Tailscale.down()` also tears down package-created
-/// Funnel listeners and clears their Funnel config best-effort.
+/// handles explicitly; `Tailscale.down()` also clears package-created
+/// publications best-effort before closing the embedded node.
 abstract class Funnel {
   /// Publishes `http://[localAddress]:[localPort]` on the public internet.
   ///
@@ -35,6 +50,9 @@ abstract class Funnel {
   /// [localAddress] must be loopback (`127.0.0.1`, `::1`, or `localhost`).
   /// This prevents accidentally publishing arbitrary LAN or metadata-service
   /// endpoints to the public internet.
+  ///
+  /// Funnel visibility applies to all handlers on [publicPort], even when this
+  /// call mounts only one [path].
   Future<TailscalePublishedService> forward({
     required int localPort,
     int publicPort = 443,
@@ -44,9 +62,12 @@ abstract class Funnel {
 
   /// Removes a Funnel publication for [publicPort] and [path].
   ///
-  /// Idempotent: clearing an absent mapping succeeds. This removes the
-  /// underlying Serve path as well; use [Serve.forward] when you want tailnet-
-  /// only publication.
+  /// Idempotent: clearing an absent mapping succeeds. Funnel and [Serve] share
+  /// one mapping namespace, so this coordinate clear removes the current
+  /// handler at [publicPort] and [path] and disables Funnel visibility for the
+  /// host and port. Prefer the exact handle's
+  /// [TailscalePublishedService.close] when replacements can race: a stale
+  /// handle cannot remove its successor.
   Future<void> clear({int publicPort = 443, String path = '/'});
 }
 
@@ -55,15 +76,21 @@ abstract class Funnel {
 Funnel createFunnel({
   required ServeForwardFn forwardFn,
   required ServeClearFn clearFn,
-}) => _Funnel(forwardFn: forwardFn, clearFn: clearFn);
+  required ServeCloseFn closeFn,
+}) => _Funnel(forwardFn: forwardFn, clearFn: clearFn, closeFn: closeFn);
 
 final class _Funnel implements Funnel {
-  _Funnel({required ServeForwardFn forwardFn, required ServeClearFn clearFn})
-    : _forward = forwardFn,
-      _clear = clearFn;
+  _Funnel({
+    required ServeForwardFn forwardFn,
+    required ServeClearFn clearFn,
+    required ServeCloseFn closeFn,
+  }) : _forward = forwardFn,
+       _clear = clearFn,
+       _close = closeFn;
 
   final ServeForwardFn _forward;
   final ServeClearFn _clear;
+  final ServeCloseFn _close;
 
   @override
   Future<TailscalePublishedService> forward({
@@ -75,10 +102,10 @@ final class _Funnel implements Funnel {
     if (Platform.isWindows) {
       throw const TailscaleFunnelException('Windows is not supported.');
     }
-    final normalizedPath = _normalizePath(path);
-    final normalizedAddress = _normalizeLocalAddress(localAddress);
-    _validatePort(publicPort, 'publicPort');
-    _validatePort(localPort, 'localPort');
+    final normalizedPath = normalizeServePath(path);
+    final normalizedAddress = normalizeServeLocalAddress(localAddress);
+    validateServePort(publicPort, 'publicPort');
+    validateServePort(localPort, 'localPort');
 
     try {
       final published = await _forward(
@@ -91,7 +118,7 @@ final class _Funnel implements Funnel {
       );
       return createPublishedServiceForFunnel(
         published: published,
-        closeFn: () => clear(publicPort: published.port, path: published.path),
+        closeFn: _close,
       );
     } catch (e) {
       if (e is TailscaleException) rethrow;
@@ -107,8 +134,8 @@ final class _Funnel implements Funnel {
     if (Platform.isWindows) {
       throw const TailscaleFunnelException('Windows is not supported.');
     }
-    final normalizedPath = _normalizePath(path);
-    _validatePort(publicPort, 'publicPort');
+    final normalizedPath = normalizeServePath(path);
+    validateServePort(publicPort, 'publicPort');
     try {
       await _clear(tailnetPort: publicPort, path: normalizedPath, funnel: true);
     } catch (e) {
@@ -119,68 +146,4 @@ final class _Funnel implements Funnel {
       );
     }
   }
-}
-
-int _validatePort(int port, String name) {
-  if (port < 1 || port > 65535) {
-    throw RangeError.range(port, 1, 65535, name);
-  }
-  return port;
-}
-
-String _normalizeLocalAddress(String localAddress) {
-  final trimmed = localAddress.trim();
-  if (trimmed.isEmpty) {
-    throw ArgumentError.value(
-      localAddress,
-      'localAddress',
-      'must not be empty',
-    );
-  }
-  if (!_isLoopbackAddress(trimmed)) {
-    throw ArgumentError.value(
-      localAddress,
-      'localAddress',
-      'must be a loopback address such as 127.0.0.1, ::1, or localhost',
-    );
-  }
-  if (trimmed.toLowerCase() == 'localhost') {
-    return '127.0.0.1';
-  }
-  return trimmed;
-}
-
-bool _isLoopbackAddress(String address) {
-  if (address.toLowerCase() == 'localhost') return true;
-  return InternetAddress.tryParse(address)?.isLoopback ?? false;
-}
-
-String _normalizePath(String path) {
-  final trimmed = path.trim();
-  if (trimmed.isEmpty) return '/';
-  if (!trimmed.startsWith('/')) {
-    throw ArgumentError.value(path, 'path', 'must start with /');
-  }
-  if (trimmed.contains('?') || trimmed.contains('#')) {
-    throw ArgumentError.value(
-      path,
-      'path',
-      'must not include query or fragment',
-    );
-  }
-  if (_containsPathTraversal(trimmed)) {
-    throw ArgumentError.value(
-      path,
-      'path',
-      'must not include . or .. segments',
-    );
-  }
-  return trimmed;
-}
-
-bool _containsPathTraversal(String path) {
-  for (final segment in path.split('/')) {
-    if (segment == '.' || segment == '..') return true;
-  }
-  return false;
 }

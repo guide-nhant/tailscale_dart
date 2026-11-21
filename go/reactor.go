@@ -31,6 +31,12 @@ const (
 // ReactorEvent is the dispatch record handed back to the Dart side per
 // readiness notification. Layout must match `_NativeReactorEvent` in
 // `lib/src/fd_transport.dart` and `DuneReactorEvent` in `cmd/dylib/main.go`.
+//
+// Errno is diagnostic only: the kqueue poller stamps it (socket error from
+// EV_EOF's Fflags / EV_ERROR's Data), the epoll poller leaves it zero (epoll
+// carries no errno; retrieving one would cost a getsockopt per event), and the
+// Dart dispatch never branches on it — errors are derived from the failing
+// read/write syscall itself, which is authoritative on both platforms.
 type ReactorEvent struct {
 	ID     int64
 	Events int32
@@ -76,7 +82,17 @@ func ReactorCreate() (int64, error) {
 }
 
 func ReactorClose(id int64) error {
-	handle := removeReactor(id)
+	// Hold the write lock across poller.Close() so it is mutually exclusive with
+	// ReactorWake (which holds the read lock across poller.Wake()). Wake runs on
+	// the main isolate while Close runs on the worker isolate at shard exit;
+	// without this the wake's write to the wake fd could land after Close freed
+	// it — and after the fd number was reused by another socketpair, injecting a
+	// stray byte into an unrelated stream. Close is rare, so the brief
+	// serialization is acceptable.
+	reactorMu.Lock()
+	defer reactorMu.Unlock()
+	handle := reactorRegistry[id]
+	delete(reactorRegistry, id)
 	if handle == nil {
 		return nil
 	}
@@ -84,7 +100,9 @@ func ReactorClose(id int64) error {
 }
 
 func ReactorWake(id int64) error {
-	handle := getReactor(id)
+	reactorMu.RLock()
+	defer reactorMu.RUnlock()
+	handle := reactorRegistry[id]
 	if handle == nil {
 		return fmt.Errorf("reactor %d not found", id)
 	}
@@ -138,12 +156,4 @@ func getReactor(id int64) *reactorHandle {
 	reactorMu.RLock()
 	defer reactorMu.RUnlock()
 	return reactorRegistry[id]
-}
-
-func removeReactor(id int64) *reactorHandle {
-	reactorMu.Lock()
-	defer reactorMu.Unlock()
-	handle := reactorRegistry[id]
-	delete(reactorRegistry, id)
-	return handle
 }

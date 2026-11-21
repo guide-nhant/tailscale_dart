@@ -3,6 +3,7 @@
 package tailscale
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,11 +62,14 @@ type HttpIncomingRequest struct {
 }
 
 type httpResponseHead struct {
-	StatusCode    int                 `json:"statusCode,omitempty"`
-	ReasonPhrase  string              `json:"reasonPhrase,omitempty"`
-	Headers       map[string][]string `json:"headers,omitempty"`
-	ContentLength int64               `json:"contentLength,omitempty"`
-	Error         string              `json:"error,omitempty"`
+	StatusCode   int                 `json:"statusCode,omitempty"`
+	ReasonPhrase string              `json:"reasonPhrase,omitempty"`
+	Headers      map[string][]string `json:"headers,omitempty"`
+	// No omitempty: a legitimate Content-Length: 0 (204, empty 200) must reach
+	// Dart as 0, not be dropped to null. Unknown length is sent as -1, which
+	// the Dart parser maps to null.
+	ContentLength int64  `json:"contentLength"`
+	Error         string `json:"error,omitempty"`
 }
 
 type httpBindingState struct {
@@ -76,25 +81,27 @@ type httpBindingState struct {
 	once     sync.Once
 }
 
-var (
-	httpBindingID       int64
-	httpBindingRegistry = map[int64]*httpBindingState{}
-	httpBindingMu       sync.Mutex
-)
+// httpBindingID allocates monotonic binding ids; see fdRegistry for why the
+// counter stays process-global while the maps live on the runtime.
+var httpBindingID int64
 
-func HttpBind(tailnetPort int) (*HttpBinding, error) {
+// HttpBind starts an fd-backed inbound HTTP binding for the exact captured
+// runtime token. Offloaded like TcpListenFd (go/tcp_fd_posix.go) — see that
+// function's comment for why this must never execute on the worker FIFO.
+func HttpBind(runtimeToken uint64, tailnetPort int) (*HttpBinding, error) {
 	if tailnetPort < 0 || tailnetPort > 65535 {
 		return nil, fmt.Errorf("invalid tailnet port %d", tailnetPort)
 	}
 
-	mu.Lock()
-	s := srv
-	mu.Unlock()
-	if s == nil {
-		return nil, fmt.Errorf("HttpBind called before Start")
+	gate, err := gateForRuntimeToken("HttpBind", runtimeToken)
+	if err != nil {
+		return nil, err
+	}
+	if err := gate.awaitDataPlaneReadyForCall(); err != nil {
+		return nil, fmt.Errorf("http bind data plane: %w", err)
 	}
 
-	ln, err := s.Listen("tcp", fmt.Sprintf(":%d", tailnetPort))
+	ln, err := gate.s.Listen("tcp", fmt.Sprintf(":%d", tailnetPort))
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on tsnet:%d: %v", tailnetPort, err)
 	}
@@ -118,29 +125,30 @@ func HttpBind(tailnetPort int) (*HttpBinding, error) {
 	}
 	state.server = newHTTPBindingServer(state)
 
-	mu.Lock()
-	if srv != s {
-		mu.Unlock()
+	if !registerHttpBinding(gate, id, state) {
 		ln.Close()
 		return nil, fmt.Errorf("HttpBind raced with Stop or server replacement")
 	}
-	mu.Unlock()
 
-	httpBindingMu.Lock()
-	httpBindingRegistry[id] = state
-	httpBindingMu.Unlock()
-
+	bindings := &gate.runtime.fd.httpBindings
 	go func() {
 		_ = state.server.Serve(ln)
 		state.close()
-		httpBindingMu.Lock()
-		if httpBindingRegistry[id] == state {
-			delete(httpBindingRegistry, id)
-		}
-		httpBindingMu.Unlock()
+		bindings.removeMatching(id, state)
 	}()
 
 	return &state.binding, nil
+}
+
+// registerHttpBinding installs [state] in the binding registry, reporting
+// whether the gated lifecycle is still live. On false nothing was installed
+// and the caller owns cleanup. The commit-point epoch check (see nodeGate)
+// replaces the old pre-lock `srv != s` recheck that left a check-to-register
+// window a concurrent Stop could slip through (the Serve-goroutine reap
+// self-healed it; now the registration is airtight and the reap covers only
+// mid-lifecycle listener death).
+func registerHttpBinding(gate nodeGate, id int64, state *httpBindingState) bool {
+	return gate.runtime.fd.httpBindings.commit(gate, id, state)
 }
 
 func newHTTPBindingServer(state *httpBindingState) *http.Server {
@@ -154,10 +162,8 @@ func newHTTPBindingServer(state *httpBindingState) *http.Server {
 }
 
 func HttpAccept(bindingID int64) (*HttpIncomingRequest, bool, error) {
-	httpBindingMu.Lock()
-	state := httpBindingRegistry[bindingID]
-	httpBindingMu.Unlock()
-	if state == nil {
+	state, ok := currentHttpBindings().get(bindingID)
+	if !ok {
 		return nil, true, nil
 	}
 
@@ -173,25 +179,7 @@ func HttpAccept(bindingID int64) (*HttpIncomingRequest, bool, error) {
 }
 
 func HttpCloseBinding(id int64) {
-	httpBindingMu.Lock()
-	state := httpBindingRegistry[id]
-	delete(httpBindingRegistry, id)
-	httpBindingMu.Unlock()
-	if state != nil {
-		state.close()
-	}
-}
-
-func closeAllHttpBindings() {
-	httpBindingMu.Lock()
-	bindings := make([]*httpBindingState, 0, len(httpBindingRegistry))
-	for id, state := range httpBindingRegistry {
-		bindings = append(bindings, state)
-		delete(httpBindingRegistry, id)
-	}
-	httpBindingMu.Unlock()
-
-	for _, state := range bindings {
+	if state, ok := currentHttpBindings().take(id); ok {
 		state.close()
 	}
 }
@@ -230,6 +218,7 @@ func (s *httpBindingState) close() {
 // HttpStart starts one tailnet HTTP request and returns private fd capabilities
 // for request and response bodies.
 func HttpStart(
+	runtimeToken uint64,
 	method string,
 	rawURL string,
 	headersJSON string,
@@ -244,11 +233,12 @@ func HttpStart(
 		return nil, errors.New("HTTP URL is required")
 	}
 
-	mu.Lock()
-	s := srv
-	mu.Unlock()
-	if s == nil {
-		return nil, errors.New("HttpStart called before Start")
+	gate, err := gateForRuntimeToken("HttpStart", runtimeToken)
+	if err != nil {
+		return nil, err
+	}
+	if err := gate.awaitDataPlaneReady(context.Background()); err != nil {
+		return nil, fmt.Errorf("HTTP client data plane: %w", err)
 	}
 
 	headers := http.Header{}
@@ -275,7 +265,7 @@ func HttpStart(
 	}
 
 	go runHttpFdRequest(
-		s,
+		gate,
 		method,
 		rawURL,
 		headers,
@@ -293,7 +283,7 @@ func HttpStart(
 }
 
 func runHttpFdRequest(
-	s *tsnet.Server,
+	gate nodeGate,
 	method string,
 	rawURL string,
 	headers http.Header,
@@ -321,7 +311,19 @@ func runHttpFdRequest(
 	req.Header = headers.Clone()
 	req.ContentLength = contentLength
 
-	client := tailnetHTTPClient(s.HTTPClient())
+	// Reuse a cached transport (connection pool + TLS session cache) across
+	// requests instead of building a fresh one per request. The per-request
+	// bits (redirect policy) live on the Client, so only the Client is
+	// per-request; the Transport is shared. See sharedTailnetTransport for the
+	// identity-lifecycle guarantee. A one-off transport (request raced Stop)
+	// is nobody's to reuse: close its pooled conns once the response body has
+	// been fully copied, so a dial that slipped in before srv.Close can't
+	// linger as an orphaned connection + goroutine.
+	transport, oneOff := sharedTailnetTransport(gate)
+	if oneOff {
+		defer transport.CloseIdleConnections()
+	}
+	client := http.Client{Transport: transport}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if !followRedirects {
 			return http.ErrUseLastResponse
@@ -340,8 +342,10 @@ func runHttpFdRequest(
 	defer resp.Body.Close()
 
 	if err := writeHTTPResponseHead(responseConn, httpResponseHead{
-		StatusCode:    resp.StatusCode,
-		ReasonPhrase:  resp.Status,
+		StatusCode: resp.StatusCode,
+		// resp.Status is the full status line ("200 OK"); package:http expects
+		// just the reason phrase ("OK"). Strip the leading "<code> ".
+		ReasonPhrase:  strings.TrimPrefix(resp.Status, strconv.Itoa(resp.StatusCode)+" "),
 		Headers:       map[string][]string(resp.Header),
 		ContentLength: resp.ContentLength,
 	}); err != nil {
@@ -352,16 +356,32 @@ func runHttpFdRequest(
 	}
 }
 
-func tailnetHTTPClient(baseClient *http.Client) http.Client {
-	client := *baseClient
-	if transport, ok := baseClient.Transport.(*http.Transport); ok {
-		cloned := transport.Clone()
-		// Match Tailscale's own outbound TLS policy: system roots first, then
-		// baked-in Let's Encrypt roots as a fallback for constrained platforms.
-		cloned.TLSClientConfig = tlsdial.Config(nil, cloned.TLSClientConfig)
-		client.Transport = cloned
+// sharedTailnetTransport returns the gated runtime's owned HTTP transport,
+// building it on first use; see nodeRuntime.tailnetTransport for the identity
+// and teardown contract (including the oneOff close-idle obligation).
+func sharedTailnetTransport(gate nodeGate) (transport *http.Transport, oneOff bool) {
+	return gate.runtime.tailnetTransport(func() *http.Transport {
+		return buildTailnetTransport(gate.s)
+	})
+}
+
+func buildTailnetTransport(s *tsnet.Server) *http.Transport {
+	base := s.HTTPClient()
+	transport, ok := base.Transport.(*http.Transport)
+	if !ok {
+		// Defensive: tsnet always returns an *http.Transport today.
+		return &http.Transport{DialContext: s.Dial}
 	}
-	return client
+	return applyTailnetTLS(transport)
+}
+
+// applyTailnetTLS returns a clone of [base] with Tailscale's outbound TLS policy
+// applied (system roots first, then baked-in Let's Encrypt roots as a fallback
+// for constrained platforms). The input is left untouched.
+func applyTailnetTLS(base *http.Transport) *http.Transport {
+	cloned := base.Clone()
+	cloned.TLSClientConfig = tlsdial.Config(nil, cloned.TLSClientConfig)
+	return cloned
 }
 
 func serveHTTPFdRequest(state *httpBindingState, w http.ResponseWriter, r *http.Request) {
@@ -475,8 +495,37 @@ func writeDartHTTPResponse(w http.ResponseWriter, r io.Reader) error {
 		}
 	}
 	w.WriteHeader(statusCode)
-	_, err = io.Copy(w, r)
-	return err
+	return flushDartHTTPBody(w, r)
+}
+
+// flushDartHTTPBody streams the Dart handler's response body to the wire,
+// flushing after each chunk. net/http buffers small writes and won't emit them
+// until the buffer fills or the handler returns, which stalls streaming
+// handlers (SSE, long-poll) that emit small events over time. Flushing each
+// chunk delivers them promptly. Uses the shared 64 KiB buffer pool rather than
+// io.Copy's per-call 32 KiB allocation.
+func flushDartHTTPBody(w http.ResponseWriter, r io.Reader) error {
+	flusher, _ := w.(http.Flusher)
+	bufp := pipeBufferPool.Get().(*[]byte)
+	defer pipeBufferPool.Put(bufp)
+	buf := *bufp
+	for {
+		n, readErr := r.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
+		}
+	}
 }
 
 func readHTTPResponseHead(r io.Reader) (httpResponseHead, error) {

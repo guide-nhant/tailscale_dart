@@ -11,10 +11,11 @@ import '_equality.dart';
 /// The node's position in the connection lifecycle. Mirrors Go's
 /// [`ipn.State`](https://pkg.go.dev/tailscale.com/ipn#State).
 enum NodeState {
-  /// No persisted credentials and the engine has not been started.
+  /// No authenticated logical state while the engine is idle.
   ///
-  /// This is the initial state when the node has never authenticated.
-  /// An auth key must be provided to [Tailscale.up] to proceed.
+  /// A persistent [Tailscale.up] may proceed without an auth key and let
+  /// upstream return [needsLogin] for interactive enrollment. Ephemeral mode
+  /// requires an auth key because it retains no local identity.
   noState,
 
   /// The node needs authentication. Open
@@ -34,23 +35,27 @@ enum NodeState {
   /// The node is connected and ready to send/receive traffic.
   running,
 
-  /// The engine is not running but persisted credentials exist.
+  /// The engine is not running and an authenticated persistent StateStore
+  /// contains logical Tailscale state.
   ///
-  /// Returned by [Tailscale.status] when the node was previously
-  /// authenticated but [Tailscale.up] has not been called yet, or after
-  /// [Tailscale.down]. The next [Tailscale.up] can reconnect without an
-  /// auth key.
-  stopped;
+  /// This does not prove that control-plane credentials are still valid. Call
+  /// [Tailscale.up] to determine the current upstream state.
+  stopped,
+
+  /// A lifecycle state added by a newer upstream Tailscale runtime that this
+  /// package does not yet recognize.
+  unknown;
 
   /// Parses a Go `ipn.State` string into a [NodeState].
   static NodeState parse(String? s) => switch (s) {
+    null || '' => NodeState.noState,
     'NoState' => NodeState.noState,
     'NeedsLogin' => NodeState.needsLogin,
     'NeedsMachineAuth' => NodeState.needsMachineAuth,
     'Starting' => NodeState.starting,
     'Running' => NodeState.running,
     'Stopped' => NodeState.stopped,
-    _ => NodeState.noState,
+    _ => NodeState.unknown,
   };
 }
 
@@ -116,9 +121,10 @@ class TailscaleStatus {
   /// Parses a status snapshot from the JSON shape produced by Go's
   /// `ipnstate.Status`.
   ///
-  /// Missing or malformed fields fall back to safe defaults (empty lists,
-  /// [NodeState.noState]) rather than throwing — callers should treat the
-  /// result as a best-effort view of the engine's reported state.
+  /// Missing fields fall back to safe defaults (empty lists and
+  /// [NodeState.noState]); a non-empty unrecognized upstream state becomes
+  /// [NodeState.unknown]. Callers should treat the result as a best-effort view
+  /// of the engine's reported state.
   factory TailscaleStatus.fromJson(Map<String, dynamic> json) {
     final self = json['Self'] as Map<String, dynamic>?;
 
@@ -141,6 +147,13 @@ class TailscaleStatus {
   /// A status representing a stopped/uninitialized engine.
   static const stopped = TailscaleStatus(
     state: NodeState.stopped,
+    tailscaleIPs: [],
+    health: [],
+  );
+
+  /// A status representing an authenticated-empty or absent persistent store.
+  static const noState = TailscaleStatus(
+    state: NodeState.noState,
     tailscaleIPs: [],
     health: [],
   );
@@ -368,7 +381,12 @@ List<String> _parseIPs(dynamic value) {
 
 DateTime? _parseTime(dynamic value) {
   if (value is String && value.isNotEmpty) {
-    return DateTime.tryParse(value);
+    final parsed = DateTime.tryParse(value);
+    // Go marshals a zero time.Time (e.g. an online peer's unset LastSeen) as
+    // "0001-01-01T00:00:00Z". Treat that sentinel as null — the documented
+    // "not tracked" value — rather than surfacing a year-1 date as real data.
+    if (parsed == null || parsed.year <= 1) return null;
+    return parsed;
   }
   return null;
 }

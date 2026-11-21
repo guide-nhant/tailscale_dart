@@ -22,9 +22,12 @@ import 'dart:typed_data';
 import 'package:tailscale/tailscale.dart';
 import 'package:test/test.dart';
 
-import '../e2e/support/native_asset_workaround.dart';
 import '../e2e/support/state_waiters.dart';
+import '../support/persistent_state_inventory.dart';
 import 'support/tailscale_api.dart';
+
+const _liveTlsHandshakeBudget = Duration(seconds: 120);
+const _liveTlsListenerBudget = Duration(seconds: 180);
 
 void main() {
   final apiKey = Platform.environment['TAILSCALE_API_KEY'];
@@ -60,7 +63,7 @@ void main() {
 
   tearDownAll(() async {
     try {
-      await tsnet?.down();
+      await tsnet?.forgetLocalIdentity();
     } catch (_) {}
     for (final id in deviceIdsToDelete) {
       try {
@@ -69,7 +72,9 @@ void main() {
     }
     try {
       final dir = stateDir;
-      if (dir != null) Directory(dir).deleteSync(recursive: true);
+      if (dir != null && Directory(dir).existsSync()) {
+        Directory(dir).deleteSync(recursive: true);
+      }
     } catch (_) {}
     try {
       final dir = clientStateDir;
@@ -81,16 +86,18 @@ void main() {
   test(
     'tls.bind serves HTTPS with an auto-provisioned Tailscale certificate',
     () async {
-      await warmUpNativeAssetForPeerSubprocesses();
-
       api = LiveTailscaleApi(apiKey: apiKey, tailnetId: tailnetId);
-      stateDir = Directory.systemTemp
-          .createTempSync('tailscale_live_tls_')
-          .path;
+      final processStateRoot = Directory.systemTemp.createTempSync(
+        'tailscale_live_tls_persistent_',
+      );
+      stateDir = processStateRoot.path;
       final authKey = await api!.createAuthKey();
       final clientAuthKey = await api!.createAuthKey();
 
-      Tailscale.init(stateDir: stateDir!);
+      Tailscale.init(
+        stateDir: stateDir!,
+        appId: 'dev.tailscale.dart.live.tls.$suffix',
+      );
       tsnet = Tailscale.instance;
       await recordUntil(
         tsnet!,
@@ -98,33 +105,51 @@ void main() {
         () => tsnet!.up(
           hostname: hostname,
           authKey: authKey,
-          ephemeral: true,
           controlUrl: controlUri(),
           timeout: const Duration(seconds: 120),
         ),
       );
 
+      final status = await tsnet!.status();
       final device = await api!.waitForDevice(
         hostname: hostname,
-        ipv4: (await tsnet!.status()).ipv4,
+        ipv4: status.ipv4,
       );
       deviceIdsToDelete.add(device.id);
 
       final domains = await _waitForTlsDomains(tsnet!);
       final server = await tsnet!.tls.bind(port: 443);
+      stdout.writeln(
+        'LIVE_TLS_SERVER ${jsonEncode({'ipv4': status.ipv4, 'domain': domains.first, 'bindAddress': server.local.address, 'bindPort': server.local.port})}',
+      );
       final handled = _serveOnePlaintextHttpRequest(server);
-      unawaited(handled.catchError((_) {}));
+      final handlerFailure = Completer<({int statusCode, String body})>();
+      unawaited(
+        handled.then<void>(
+          (_) {},
+          onError: (Object error, StackTrace stackTrace) {
+            if (!handlerFailure.isCompleted) {
+              handlerFailure.completeError(error, stackTrace);
+            }
+          },
+        ),
+      );
+      late final List<Map<String, Object>> inventory;
       try {
         clientStateDir = Directory.systemTemp
             .createTempSync('tailscale_live_tls_client_')
             .path;
-        final response = await _runClientFetch(
-          stateDir: clientStateDir!,
-          hostname: clientHostname,
-          authKey: clientAuthKey,
-          controlUrl: controlUrl,
-          url: Uri.https(domains.first, '/live-tls'),
-        );
+        final response = await Future.any([
+          _runClientFetch(
+            stateDir: clientStateDir!,
+            appId: 'dev.tailscale.dart.live.tls.client',
+            hostname: clientHostname,
+            authKey: clientAuthKey,
+            controlUrl: controlUrl,
+            url: Uri.https(domains.first, '/live-tls'),
+          ),
+          handlerFailure.future,
+        ]);
 
         try {
           final clientDevice = await api!.waitForDevice(
@@ -136,38 +161,41 @@ void main() {
         expect(response.statusCode, 200);
         expect(response.body, 'hello from tls');
         await handled.timeout(const Duration(seconds: 15));
-      } catch (_) {
-        await handled.catchError((_) {});
-        rethrow;
       } finally {
         await server.close();
+        inventory = auditPersistentRuntimeInventory(stateDir!);
+        stdout.writeln('R6_TLS_STATE_INVENTORY ${jsonEncode(inventory)}');
       }
+
+      expect(
+        inventory.any((entry) => entry['category'] == 'certificate-key'),
+        isTrue,
+        reason: 'the completed TLS handshake must inventory its private key',
+      );
     },
-    timeout: const Timeout(Duration(minutes: 3)),
+    timeout: const Timeout(Duration(minutes: 7)),
   );
 }
 
 Future<({int statusCode, String body})> _runClientFetch({
   required String stateDir,
+  required String appId,
   required String hostname,
   required String authKey,
   required String? controlUrl,
   required Uri url,
 }) async {
-  await detachLoadedNativeAssetForPeerSubprocesses();
   final process = await Process.start(
     Platform.resolvedExecutable,
-    [
-      'run',
-      '--enable-experiment=native-assets',
-      'test/live_tailscale/live_tls_fetch_main.dart',
-    ],
+    ['run', 'test/live_tailscale/live_tls_fetch_main.dart'],
     environment: {
       ...Platform.environment,
       'STATE_DIR': stateDir,
+      'APP_ID': appId,
       'HOSTNAME': hostname,
       'AUTH_KEY': authKey,
       'URL': url.toString(),
+      'FETCH_BUDGET_SECONDS': '150',
       if (controlUrl != null && controlUrl.isNotEmpty)
         'CONTROL_URL': controlUrl,
     },
@@ -211,7 +239,7 @@ Future<({int statusCode, String body})> _runClientFetch({
   );
 
   try {
-    return await result.future.timeout(const Duration(seconds: 90));
+    return await result.future.timeout(const Duration(minutes: 5));
   } finally {
     try {
       process.kill(ProcessSignal.sigterm);
@@ -237,39 +265,44 @@ Future<List<String>> _waitForTlsDomains(Tailscale tsnet) async {
 }
 
 Future<void> _serveOnePlaintextHttpRequest(TailscaleListener server) async {
-  final conn = await server.connections.first.timeout(
-    const Duration(seconds: 90),
-  );
-  try {
-    await _readHttpRequestHead(conn.input);
-    await conn.output.write(
-      ascii.encode(
-        'HTTP/1.1 200 OK\r\n'
-        'content-length: 14\r\n'
-        'content-type: text/plain\r\n'
-        'connection: close\r\n'
-        '\r\n'
-        'hello from tls',
-      ),
-    );
-    await conn.output.close();
-  } finally {
-    await conn.close();
+  await for (final conn in server.connections.timeout(_liveTlsListenerBudget)) {
+    try {
+      // tls.Listener.Accept returns before the handshake is complete. First
+      // certificate issuance can close an early attempt before any plaintext
+      // HTTP bytes arrive, so keep the listener subscription alive and allow
+      // the client's bounded retry loop to establish a fresh connection.
+      if (!await _readHttpRequestHead(conn.input)) continue;
+      await conn.output.write(
+        ascii.encode(
+          'HTTP/1.1 200 OK\r\n'
+          'content-length: 14\r\n'
+          'content-type: text/plain\r\n'
+          'connection: close\r\n'
+          '\r\n'
+          'hello from tls',
+        ),
+      );
+      await conn.output.close();
+      return;
+    } finally {
+      await conn.close();
+    }
   }
+  fail('TLS listener closed before receiving a complete HTTP request head.');
 }
 
-Future<void> _readHttpRequestHead(Stream<Uint8List> input) async {
+Future<bool> _readHttpRequestHead(Stream<Uint8List> input) async {
   final buffer = BytesBuilder();
   await for (final chunk in input.timeout(
-    const Duration(seconds: 15),
+    _liveTlsHandshakeBudget,
     onTimeout: (sink) => sink.close(),
   )) {
     buffer.add(chunk);
     if (ascii
         .decode(buffer.toBytes(), allowInvalid: true)
         .contains('\r\n\r\n')) {
-      return;
+      return true;
     }
   }
-  fail('TLS listener did not receive a complete HTTP request head.');
+  return false;
 }

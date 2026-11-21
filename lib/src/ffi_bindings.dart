@@ -11,23 +11,139 @@ import 'package:ffi/ffi.dart';
 
 /// Starts the Tailscale node.
 /// Returns JSON:
-///   {"ok": true} on success
-///   {"error": "..."} on failure.
+///   {"ok": true, "alreadyActive": bool} on success
+///   {"error": "...", "code": "..."?} on failure.
 @ffi.Native<
   ffi.Pointer<Utf8> Function(
-    ffi.Pointer<Utf8>,
+    ffi.Uint64,
     ffi.Pointer<Utf8>,
     ffi.Pointer<Utf8>,
     ffi.Pointer<Utf8>,
     ffi.Int32,
+    ffi.Pointer<Utf8>,
+    ffi.Int64,
   )
 >(symbol: 'DuneStart')
 external ffi.Pointer<Utf8> duneStart(
+  int requestToken,
   ffi.Pointer<Utf8> hostname,
   ffi.Pointer<Utf8> authKey,
   ffi.Pointer<Utf8> controlURL,
-  ffi.Pointer<Utf8> stateDir,
   int ephemeral,
+  ffi.Pointer<Utf8> hostNetworkSnapshot,
+  int bootstrapBudgetMillis,
+);
+
+/// Marks the exact runtime's initiating public up call as settled.
+@ffi.Native<ffi.Void Function(ffi.Uint64)>(symbol: 'DuneMarkUpSettled')
+external void duneMarkUpSettled(int runtimeToken);
+
+/// Freezes the process-wide state-root, Keybay namespace, and log level.
+/// Returns `{"stateDir": "<canonical-native-path>"}` on success.
+@ffi.Native<
+  ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int32)
+>(symbol: 'DuneConfigure')
+external ffi.Pointer<Utf8> duneConfigure(
+  ffi.Pointer<Utf8> stateRoot,
+  ffi.Pointer<Utf8> keybayNamespace,
+  int logLevel,
+);
+
+/// Supplies the platform's writable temporary directory as the ephemeral
+/// scratch parent. Go's own os.TempDir() fallback is not app-writable on
+/// Android, so Dart passes Directory.systemTemp right after configure.
+/// Set-once; empty and repeated values are ignored natively.
+@ffi.Native<ffi.Void Function(ffi.Pointer<Utf8>)>(
+  symbol: 'DuneSetEphemeralScratchParent',
+)
+external void duneSetEphemeralScratchParent(ffi.Pointer<Utf8> parent);
+
+/// Acquires the configured root's token-bound persistent-state lease.
+/// Public persistent operations call it before any secure-state probe or
+/// Keybay operation.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneBeginPersistentPreparation',
+)
+external ffi.Pointer<Utf8> duneBeginPersistentPreparation(int requestToken);
+
+/// Performs keyless format classification while the preparation lease is held.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneInspectPersistentPreparation',
+)
+external ffi.Pointer<Utf8> duneInspectPersistentPreparation(int requestToken);
+
+/// Marks that a non-cancellable caller-isolate Keybay operation may begin.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneMarkCustodyActive',
+)
+external ffi.Pointer<Utf8> duneMarkCustodyActive(int requestToken);
+
+/// Marks the possibly-committed boundary immediately before a fresh DEK write.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneMarkCustodyWriteAttempted',
+)
+external ffi.Pointer<Utf8> duneMarkCustodyWriteAttempted(int requestToken);
+
+/// Combines the native layout with Keybay presence without accepting a key.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32)>(
+  symbol: 'DuneResolvePersistentCustody',
+)
+external ffi.Pointer<Utf8> duneResolvePersistentCustody(
+  int requestToken,
+  int dekPresent,
+);
+
+/// Supplies exactly 32 raw DEK bytes to the matching native preparation.
+@ffi.Native<
+  ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Int64)
+>(symbol: 'DuneSupplyPreparedDEK')
+external ffi.Pointer<Utf8> duneSupplyPreparedDek(
+  int requestToken,
+  ffi.Pointer<ffi.Uint8> key,
+  int keyLength,
+);
+
+/// Authenticates an existing envelope or creates the initial empty one.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DunePreparePersistentState',
+)
+external ffi.Pointer<Utf8> dunePreparePersistentState(int requestToken);
+
+/// Completes normal (non-abandoned) Keybay custody.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneCompletePersistentCustody',
+)
+external ffi.Pointer<Utf8> duneCompletePersistentCustody(int requestToken);
+
+/// Closes a normal idle/no-state preparation and releases its lease.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneFinishPreparedPersistentState',
+)
+external ffi.Pointer<Utf8> duneFinishPreparedPersistentState(int requestToken);
+
+/// Stops any active runtime without releasing its state lease, then creates a
+/// durable local-reset marker before Keybay custody may be changed.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneBeginLocalReset',
+)
+external ffi.Pointer<Utf8> duneBeginLocalReset(int requestToken);
+
+/// Completes local reset after the exact Keybay DEK deletion settles.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32)>(
+  symbol: 'DuneFinishLocalReset',
+)
+external ffi.Pointer<Utf8> duneFinishLocalReset(
+  int requestToken,
+  int custodyDeletionSucceeded,
+);
+
+/// Releases abandoned custody after its Future and compensation have settled.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32)>(
+  symbol: 'DuneFinishCustody',
+)
+external ffi.Pointer<Utf8> duneFinishCustody(
+  int requestToken,
+  int cleanupSucceeded,
 );
 
 /// Starts one outgoing tailnet HTTP request.
@@ -37,6 +153,7 @@ external ffi.Pointer<Utf8> duneStart(
 ///   {"error": "..."} on failure.
 @ffi.Native<
   ffi.Pointer<Utf8> Function(
+    ffi.Uint64,
     ffi.Pointer<Utf8>,
     ffi.Pointer<Utf8>,
     ffi.Pointer<Utf8>,
@@ -46,6 +163,7 @@ external ffi.Pointer<Utf8> duneStart(
   )
 >(symbol: 'DuneHttpStart')
 external ffi.Pointer<Utf8> duneHttpStart(
+  int runtimeToken,
   ffi.Pointer<Utf8> method,
   ffi.Pointer<Utf8> url,
   ffi.Pointer<Utf8> headersJson,
@@ -54,21 +172,16 @@ external ffi.Pointer<Utf8> duneHttpStart(
   int maxRedirects,
 );
 
-/// Provides a host network-interface snapshot to the native runtime.
-///
-/// This is currently used on Android before startup because Go's standard
-/// netlink-based interface discovery can be denied by the app sandbox.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>(
-  symbol: 'DuneSetNetworkInterfaces',
-)
-external ffi.Pointer<Utf8> duneSetNetworkInterfaces(ffi.Pointer<Utf8> snapshot);
-
 /// Starts an fd-backed inbound HTTP binding.
 /// Returns JSON:
 ///   {"bindingId": N, "tailnetAddress": "...", "tailnetPort": N} on success
 ///   {"error": "..."} on failure.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Int32)>(symbol: 'DuneHttpBind')
-external ffi.Pointer<Utf8> duneHttpBind(int tailnetPort);
+///
+/// [runtimeToken] must identify the runtime captured before helper admission.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32)>(
+  symbol: 'DuneHttpBind',
+)
+external ffi.Pointer<Utf8> duneHttpBind(int runtimeToken, int tailnetPort);
 
 /// Blocks until an inbound HTTP binding accepts one request or closes.
 ///
@@ -91,10 +204,17 @@ external void duneHttpCloseBinding(int bindingId);
 ///   {"error": "..."} on failure.
 ///
 /// POSIX-only backend primitive. Unsupported platforms fail explicitly.
+/// [runtimeToken] must identify the runtime captured before helper admission.
 @ffi.Native<
-  ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int32, ffi.Int64)
+  ffi.Pointer<Utf8> Function(
+    ffi.Uint64,
+    ffi.Pointer<Utf8>,
+    ffi.Int32,
+    ffi.Int64,
+  )
 >(symbol: 'DuneTcpDialFd')
 external ffi.Pointer<Utf8> duneTcpDialFd(
+  int runtimeToken,
   ffi.Pointer<Utf8> host,
   int port,
   int timeoutMillis,
@@ -105,10 +225,13 @@ external ffi.Pointer<Utf8> duneTcpDialFd(
 /// Returns JSON:
 ///   {"listenerId": N, "localAddress": "...", "localPort": N} on success.
 ///   {"error": "..."} on failure.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Int32, ffi.Pointer<Utf8>)>(
-  symbol: 'DuneTcpListenFd',
-)
+///
+/// [runtimeToken] must identify the runtime captured before helper admission.
+@ffi.Native<
+  ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32, ffi.Pointer<Utf8>)
+>(symbol: 'DuneTcpListenFd')
 external ffi.Pointer<Utf8> duneTcpListenFd(
+  int runtimeToken,
   int tailnetPort,
   ffi.Pointer<Utf8> tailnetHost,
 );
@@ -122,10 +245,13 @@ external ffi.Pointer<Utf8> duneTcpListenFd(
 /// Accepted connections are still retrieved through [duneTcpAcceptFd] because
 /// the native runtime terminates TLS and exposes the resulting plaintext stream
 /// as the same local fd capability used by TCP listeners.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Int32, ffi.Pointer<Utf8>)>(
-  symbol: 'DuneTlsListenFd',
-)
+///
+/// [runtimeToken] must identify the runtime captured before helper admission.
+@ffi.Native<
+  ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Int32, ffi.Pointer<Utf8>)
+>(symbol: 'DuneTlsListenFd')
 external ffi.Pointer<Utf8> duneTlsListenFd(
+  int runtimeToken,
   int tailnetPort,
   ffi.Pointer<Utf8> tailnetHost,
 );
@@ -147,12 +273,24 @@ external void duneTcpCloseFdListener(int listenerId);
 /// Starts a POSIX fd-backed UDP datagram binding.
 ///
 /// Returns JSON:
-///   {"fd": N, "localAddress": "...", "localPort": N} on success.
-///   {"error": "..."} on failure.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int32)>(
-  symbol: 'DuneUdpBindFd',
-)
-external ffi.Pointer<Utf8> duneUdpBindFd(ffi.Pointer<Utf8> host, int port);
+///   {"fd": N, "bindingId": N, "localAddress": "...", "localPort": N} on
+///   success. {"error": "..."} on failure.
+///
+/// [runtimeToken] must identify the runtime captured before helper admission.
+@ffi.Native<
+  ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, ffi.Int32)
+>(symbol: 'DuneUdpBindFd')
+external ffi.Pointer<Utf8> duneUdpBindFd(
+  int runtimeToken,
+  ffi.Pointer<Utf8> host,
+  int port,
+);
+
+/// Tears down the UDP bridge for [bindingId] (closes the tsnet PacketConn,
+/// wakes and exits both bridge goroutines). Keyed by the opaque monotonic id
+/// from the bind response — never the fd, whose OS number the kernel reuses.
+@ffi.Native<ffi.Void Function(ffi.Int64)>(symbol: 'DuneUdpCloseBinding')
+external void duneUdpCloseBinding(int bindingId);
 
 /// Creates one native fd reactor poller and returns an opaque handle, or -1 on
 /// failure.
@@ -222,6 +360,7 @@ external ffi.Pointer<Utf8> duneTlsDomains();
 
 /// Tailscale-level ping to a tailnet node.
 ///
+/// [runtimeToken] must identify the runtime captured before helper admission.
 /// `timeoutMillis <= 0` means no timeout. `pingType` is one of
 /// "disco" (default), "tsmp", "icmp".
 ///
@@ -231,9 +370,15 @@ external ffi.Pointer<Utf8> duneTlsDomains();
 ///     on success.
 ///   {"error": "..."} on failure.
 @ffi.Native<
-  ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Int32, ffi.Pointer<Utf8>)
+  ffi.Pointer<Utf8> Function(
+    ffi.Uint64,
+    ffi.Pointer<Utf8>,
+    ffi.Int32,
+    ffi.Pointer<Utf8>,
+  )
 >(symbol: 'DuneDiagPing')
 external ffi.Pointer<Utf8> duneDiagPing(
+  int runtimeToken,
   ffi.Pointer<Utf8> ip,
   int timeoutMillis,
   ffi.Pointer<Utf8> pingType,
@@ -243,6 +388,9 @@ external ffi.Pointer<Utf8> duneDiagPing(
 /// `{"metrics": "..."}` on success, `{"error": "..."}` on failure.
 @ffi.Native<ffi.Pointer<Utf8> Function()>(symbol: 'DuneDiagMetrics')
 external ffi.Pointer<Utf8> duneDiagMetrics();
+
+@ffi.Native<ffi.Pointer<Utf8> Function()>(symbol: 'DuneDebugNodeState')
+external ffi.Pointer<Utf8> duneDebugNodeState();
 
 /// Current DERP relay map. Returns JSON
 /// `{"regions": {...}, "omitDefaultRegions": bool}` on success,
@@ -257,18 +405,39 @@ external ffi.Pointer<Utf8> duneDiagDERPMap();
 @ffi.Native<ffi.Pointer<Utf8> Function()>(symbol: 'DuneDiagCheckUpdate')
 external ffi.Pointer<Utf8> duneDiagCheckUpdate();
 
-/// Returns 1 if the state directory has a valid machine key, 0 otherwise.
-@ffi.Native<ffi.Int32 Function(ffi.Pointer<Utf8>)>(symbol: 'DuneHasState')
-external int duneHasState(ffi.Pointer<Utf8> stateDir);
+/// Performs remote-first logout for the exact active/preparation token.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>)>(
+  symbol: 'DuneLogout',
+)
+external ffi.Pointer<Utf8> duneLogout(
+  int requestToken,
+  ffi.Pointer<Utf8> hostNetworkSnapshot,
+);
 
-/// Stops the server and removes the state directory.
-/// Returns JSON: {"ok": true} on success, {"error": "..."} on failure.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>(symbol: 'DuneLogout')
-external ffi.Pointer<Utf8> duneLogout(ffi.Pointer<Utf8> stateDir);
+/// Event-silently quarantines exactly one runtime/preparation token.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(symbol: 'DuneAbandon')
+external ffi.Pointer<Utf8> duneAbandon(int requestToken);
 
-/// Stops the server, preserving state.
-@ffi.Native<ffi.Void Function()>(symbol: 'DuneStop')
-external void duneStop();
+/// Joins cleanup for a token that was already quarantined.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneAwaitRuntimeQuiescence',
+)
+external ffi.Pointer<Utf8> duneAwaitRuntimeQuiescence(int requestToken);
+
+/// Retires an unmatched pre-dispatch quarantine after its originating Dart
+/// Future or worker can no longer enter native code.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneRetireAbandonedRuntimeToken',
+)
+external ffi.Pointer<Utf8> duneRetireAbandonedRuntimeToken(int requestToken);
+
+/// Retires a terminal lifecycle receipt after the caller isolate receives it.
+@ffi.Native<ffi.Void Function(ffi.Uint64)>(symbol: 'DuneAcknowledgeLifecycle')
+external void duneAcknowledgeLifecycle(int requestToken);
+
+/// Stops only the matching runtime token, preserving state.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(symbol: 'DuneStop')
+external ffi.Pointer<Utf8> duneStop(int requestToken);
 
 /// Returns the local-node Tailscale status as JSON.
 @ffi.Native<ffi.Pointer<Utf8> Function()>(symbol: 'DuneStatus')
@@ -297,10 +466,29 @@ external ffi.Pointer<Utf8> duneExitNodeSuggest();
 external ffi.Pointer<Utf8> duneExitNodeUseAuto();
 
 /// Publishes a local HTTP service through Tailscale Serve/Funnel.
-@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>(
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>)>(
   symbol: 'DuneServeForward',
 )
-external ffi.Pointer<Utf8> duneServeForward(ffi.Pointer<Utf8> payloadJson);
+external ffi.Pointer<Utf8> duneServeForward(
+  int runtimeToken,
+  ffi.Pointer<Utf8> payloadJson,
+);
+
+/// Confirms that Dart received and validated one exact publication handle.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Uint64, ffi.Uint64)>(
+  symbol: 'DuneAcknowledgePublication',
+)
+external ffi.Pointer<Utf8> duneAcknowledgePublication(
+  int runtimeToken,
+  int generation,
+  int mappingToken,
+);
+
+/// Fails closed when Dart cannot prove publication-handle delivery.
+@ffi.Native<ffi.Pointer<Utf8> Function(ffi.Uint64)>(
+  symbol: 'DuneFailPublicationDelivery',
+)
+external ffi.Pointer<Utf8> duneFailPublicationDelivery(int runtimeToken);
 
 /// Removes a Tailscale Serve/Funnel publication.
 @ffi.Native<ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>)>(
@@ -311,10 +499,6 @@ external ffi.Pointer<Utf8> duneServeClear(ffi.Pointer<Utf8> payloadJson);
 /// Frees a pointer allocated by the Go layer.
 @ffi.Native<ffi.Void Function(ffi.Pointer<Utf8>)>(symbol: 'DuneFree')
 external void duneFree(ffi.Pointer<Utf8> ptr);
-
-/// Sets the Go log level. 0=silent (default), 1=errors, 2=info.
-@ffi.Native<ffi.Void Function(ffi.Int32)>(symbol: 'DuneSetLogLevel')
-external void duneSetLogLevel(int level);
 
 /// Initializes the Dart DL API for native push notifications.
 /// Must be called once with NativeApi.initializeApiDLData.

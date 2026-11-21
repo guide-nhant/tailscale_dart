@@ -38,12 +38,17 @@ Future<void> main(List<String> args) async {
     exit(64);
   }
 
-  Tailscale.init(stateDir: stateDir, logLevel: TailscaleLogLevel.error);
+  Tailscale.init(
+    stateDir: stateDir,
+    appId: 'com.example.tailscaleTcpEcho',
+    logLevel: TailscaleLogLevel.error,
+  );
   final tsnet = Tailscale.instance;
 
   final status = await tsnet.up(
     hostname: 'tcp-echo-${args[0]}',
     authKey: authKey,
+    ephemeral: true,
   );
   if (!status.isRunning) {
     stderr.writeln('Node did not reach running state: ${status.state}');

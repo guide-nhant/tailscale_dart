@@ -1,9 +1,18 @@
 # API roadmap
 
+The launch-critical architecture work is tracked in the
+[accepted rearchitecture plan](rearchitecture-plan.md). Its runtime ownership,
+auth conformance, encrypted StateStore, fail-safe teardown, publication
+convergence, and platform-proof work takes priority over new feature breadth.
+The plan records completed R2-R5 and R7-R9 work plus the remaining physical
+R6/R10 evidence; this roadmap continues to describe public API priorities.
+
 This package is consumer-first rather than full Tailscale CLI parity. The
 current public spine is already useful for embedded Dart and Flutter apps:
 
 - node lifecycle, auth, status, inventory, and pushed state streams
+- Keybay-backed encrypted persistence, explicit local forget, and Keybay-free
+  ephemeral nodes
 - outbound HTTP through `http.client`
 - inbound HTTP with `http.bind`
 - raw TCP, UDP, and TLS-terminated listeners
@@ -12,15 +21,21 @@ current public spine is already useful for embedded Dart and Flutter apps:
 
 Windows remains out of scope for this release. The POSIX data plane depends on
 fd capabilities plus kqueue/epoll; Windows needs a separate backend decision.
+Persistent support also follows Keybay's platform boundary: Android API 31+ and
+Linux desktop with `secret-tool` plus an available, unlocked Secret Service.
+Older Android and headless Linux use explicit ephemeral mode.
 
 ## Remaining feature priorities
 
 | Priority | Area | Why it matters | Current stance |
 | --- | --- | --- | --- |
-| P0 | Publishing readiness | Users need accurate README, changelog, platform metadata, package contents, and repeatable validation commands before public release. | Completed for the `0.3.x` public release line. |
+| P0 | Runtime and lifecycle conformance | One `nodeRuntime`, non-destructive enrollment, and automatic fail-safe teardown are the ownership foundation for every public namespace. | R2-R5 and R7-R9 are complete. R8 retained the measured cache and moved it onto `nodeRuntime`; run the R10 physical gate before declaring the rearchitecture complete. |
+| P0 | Encrypted node state | Persistent node identity must resist state-directory/backup copying without rebuilding platform custody already provided by Keybay. | R4d plus non-device R6 evidence are implemented: encrypted StateStore, direct Keybay custody, explicit reset, runtime-file classification, and first-party backup integration. Real-device custody/readback and mobile inventories remain release gates. |
+| P0 | Serve/Funnel and mobile truth | Serve and Funnel share upstream state, while TLS certificate lookup is disabled on iOS/Android. | R5 implements one first-Up/config authority, ServeConfig Funnel, bounded ETag writes, and exact handles. Hosted tailnet/swap and macOS persisted process-crash/restart receipts passed 2026-08-10. Keep `tls.bind` explicitly unsupported in conformance with upstream and ServeConfig Funnel unqualified until separate device/sidecar receipts pass. |
+| P0 | Publishing readiness | Users need accurate README, changelog, platform metadata, package contents, and repeatable validation commands before public release. | Historical `0.3.x` gate completed; R10 in the rearchitecture plan is the next launch gate. |
 | P1 | Windows backend decision | Windows is the only major platform gap. Supporting it likely requires either a Windows-native handle/reactor backend or a separate fallback carrier. | Deferred intentionally; do not expose as supported until designed. |
-| P2 | Taildrop | Useful for app-to-app file transfer, but upstream semantics are user-device-oriented and the byte-path decision should stay stream-safe. | Declared API, not implemented. |
-| P2 | Profiles | Useful when one app needs multiple tailnet identities, but most embedded apps only need one node identity. | Declared API, not implemented. |
+| P2 | Taildrop | Useful for app-to-app file transfer, but upstream semantics are user-device-oriented and the byte-path decision should stay stream-safe. | Roadmap only; not exported until implemented. |
+| P2 | Profiles | Useful when one app needs multiple tailnet identities, but most embedded apps only need one node identity. | Roadmap only; not exported until implemented. |
 | P2 | Tailscale Services | Useful for tagged service hosts and stable service names; upstream `ListenService` is now available in the current `tailscale.com` pin. | Design the Dart listener shape before exposing it. |
 | P3 | Generic LocalAPI escape hatch | Helps advanced users reach endpoints before a typed wrapper exists, but it can freeze an awkward low-level API if added too early. | Wait until the typed surface settles. |
 | P3 | Advanced Serve/Funnel config | Raw config get/set, directory serving, richer policy inspection, and persistent background publications could be useful for operator tools. | Keep `forward/clear` small until real users need more. |
@@ -45,10 +60,10 @@ Strongest use cases:
 - receive files into an app-managed inbox where the app owns persistence,
   validation, and user approval
 
-The API is already stream-shaped (`Stream<Uint8List>`) so callers can avoid
-loading whole files into memory. The unresolved implementation choice is whether
-to use fd-backed streaming, LocalAPI streaming, or a thin wrapper around
-upstream Taildrop internals.
+Any future API should be stream-shaped so callers can avoid loading whole files
+into memory. The unresolved implementation choice is whether to use fd-backed
+streaming, LocalAPI streaming, or a thin wrapper around upstream Taildrop
+internals.
 
 ### Profiles
 
@@ -57,6 +72,10 @@ Strongest use cases:
 - one app switches between a personal tailnet and a work tailnet
 - development builds switch between staging and production tailnets without
   deleting local state
+
+Profile switching is deliberately outside the current rearchitecture. A future
+switch is a generation-changing teardown/start operation; it must never mutate
+the identity of a live `nodeRuntime` in place.
 
 Profiles are useful, but optional. They add account/state complexity without
 improving the common "one embedded node per app install" path.

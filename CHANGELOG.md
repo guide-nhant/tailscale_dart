@@ -1,3 +1,365 @@
+## Unreleased — rearchitecture in progress
+
+The R4d secure-state cutover, lifecycle foundations, R5 runtime-owned
+publication convergence, and R7 transport/registry/watcher ownership moves are
+implemented in the current source. Hosted R5 tailnet/swap receipts and the
+macOS production-Keybay process-crash/restart receipt passed on 2026-08-10;
+R8's cache-retention decision, R9's conformance audit, and the non-device R6
+inventory/backup integration completed on 2026-08-11. Real-device Keybay,
+backup readback, private-data-plane/publication, and the R10 physical launch
+gate remain before release.
+
+**Conformance and performance closeout:**
+
+- Removed unsupported auto-update mutation and lifecycle-breaking
+  `PrefsUpdate.wantRunning` / `PrefsUpdate.hostname` controls. Hostname remains
+  an `up()` configuration, while current hostname and running intent remain
+  available in the read-only preferences snapshot.
+- Removed the exported Taildrop and Profiles stubs, their placeholder value
+  types, and unused exceptions. These features remain roadmap-only until an
+  implementation can satisfy their upstream semantics.
+- Unknown upstream backend states now parse as `NodeState.unknown` instead of
+  being misreported as unauthenticated `noState`.
+- Corrected the embedded-runtime update, default-hostname, ephemeral-logout,
+  and exit-node stream documentation. Linked the hosted Serve/Funnel swap
+  receipt directly to issue #87.
+- Fixed the raw-disco compatibility pin to use upstream `envknob.Setenv`;
+  `os.Setenv` did not update magicsock's already-registered knob. A pinned
+  v1.102.2 source contract now proves raw-socket creation remains opt-in. The
+  pin stays in place until the physical Android launch receipt passes.
+- Raised the minimum SDK to Dart 3.12 and removed the obsolete Linux
+  native-asset detach/warmup workaround now that the supported toolchain
+  includes the delete-before-copy dylib fix.
+- Widened the Keybay constraint to the semver-compatible `^0.1.0` range so the
+  package passes dependency-constraint publication validation.
+- Default `udp.bind()` now asks the initialized upstream server for
+  `TailscaleIPs()` directly instead of materializing the public full-status
+  model in Dart solely to recover the node's IPv4 address.
+- `tls.bind()` rejects iOS and Android immediately at the native boundary,
+  matching upstream's compiled-out LocalAPI certificate endpoint instead of
+  implying that a package-specific certificate workaround is planned.
+- Retained the runtime-owned accept-identity cache from measured evidence. At
+  32 callers on the final integrated macOS run, cached lookup measured about
+  5.14M/s and 945 ns CPU/lookup versus 18,446/s and 236.664 µs direct;
+  cached/direct TCP and HTTP accepts plus a real netmap-replacement load receipt
+  passed. The retained cache now lives on `nodeRuntime`, removing the last unsanctioned
+  identity process-global.
+- The R9 audit now records the narrow direct APIs, justified status calls,
+  typed error authorities, OmitAuth/private-Dial trust boundary, and the two
+  unavoidable prose backstops.
+
+**R6 non-device evidence:**
+
+- Headscale E2E now emits a content-free persistent-tree receipt after
+  HTTP/TCP/UDP use and rejects unknown artifacts, symlinks, or unsafe modes.
+  Explicit categories cover the encrypted envelope, log credential/logs,
+  ACME certificate material, and upstream profile netmap cache.
+- The persistent Flutter demo now sets and reads back Apple backup exclusion
+  before enabling its state root, and packages Android API-31+ plus legacy
+  cloud/device-transfer exclusion rules for the exact state directory. macOS,
+  iOS-simulator, and Android APK builds passed.
+
+**Android:**
+
+- Fixed ephemeral startup on Android app processes: the ephemeral scratch
+  parent is now the Dart-supplied platform temporary directory instead of Go's
+  `os.TempDir()` fallback, which resolves to the shell-only `/data/local/tmp`
+  inside an app sandbox and made every ephemeral `up()` fail with permission
+  denied. Found by the first arm64 emulator runtime receipt, which now passes:
+  two full lifecycle generations in one app process reach upstream NeedsLogin
+  with no seccomp SIGSYS.
+
+**Secure-state foundation:**
+
+- Persistent nodes now use a concurrency-safe Go StateStore persisted as one
+  authenticated encrypted envelope. One random 32-byte DEK lives in the
+  dedicated `<appId>.tailscale` Keybay namespace and is retained in memory for
+  the runtime lifetime; routine StateStore mutations do not call Keybay.
+- Persistent startup and idle status fail closed on missing or unavailable
+  custody, key/file or format conflicts, failed permission verification,
+  tampering, and incomplete reset. There is no plaintext fallback and no
+  migration from pre-launch SQLite or plaintext FileStore state.
+- Ephemeral startup now requires an auth key, uses an in-memory StateStore and
+  an owner-only temporary tsnet directory, and never accesses Keybay. It
+  rejects a configured root with filesystem-visible persistent package state.
+- Added `forgetLocalIdentity()`, the explicit local-only destructive reset. It
+  durably records intent, deletes the exact Keybay DEK, and removes only the
+  package-owned Tailscale subtree; interrupted reset remains fail closed and is
+  resumed by calling the method again.
+- Persistent custody follows Keybay's platform contract: Android requires API
+  31+, and Linux requires desktop `secret-tool` plus an available, unlocked
+  Secret Service. Older Android and headless Linux remain available only in
+  explicit ephemeral mode.
+- Only logical StateStore data is encrypted. Upstream log configuration, logs,
+  and TLS/certificate sidecars in the package subtree remain outside that
+  encryption boundary and still require owner-only enforcement, backup
+  exclusion, and the R6 inventory receipts.
+
+**Lifecycle hardening:**
+
+- A caller-isolate supervisor now owns replaceable worker instances and exact
+  native runtime tokens. Unexpected worker exit quarantines the matching
+  generation, joins its watcher/background publishers, emits one structured
+  incident, and permits a later clean worker binding.
+- Completed `down()`/`logout()` results remain token-retained until the caller
+  isolate acknowledges them, so worker death between native completion and
+  Dart delivery cannot swallow cleanup errors or falsify logout disposition.
+- Failed Server/Store cleanup, startup unwind, or final logout disposition now
+  returns `runtimeCleanupFailed` and keeps lifecycle admission closed until
+  process restart. Teardown also publishes an empty peer snapshot so existing
+  subscribers cannot retain a stale tailnet inventory.
+- `up(timeout:)` quarantines its generation before reporting
+  `startupTimeout`; a non-cancellable late `Server.Start` can no longer leave
+  an active node behind the failed Future. Pre-dispatch abandonment tombstones
+  are retired only after the originating Future settles or its worker exits,
+  keeping that race closed without unbounded bookkeeping growth.
+- `logout()` is remote-first. Failed or timed-out revocation closes the
+  possibly-mutated runtime, preserves local state, and reports
+  `logoutIndeterminate`. Confirmed success lets upstream remove the logical
+  profile but still preserves the lower-level StateStore container; physical
+  deletion is reserved for `forgetLocalIdentity()`. A
+  temporary runtime reconstructed after `down()` remains hidden from public
+  state streams, so successful idle logout emits `noState` without a phantom
+  second `stopped` transition.
+- Idle logout reconstruction uses only the exact configuration proven applied
+  by a successful `Server.Start`; a fresh failed attempt invalidates any older
+  cached tuple instead of risking the wrong control plane.
+
+**Serve/Funnel convergence:**
+
+- Serve and Funnel now mutate one runtime-owned upstream `ServeConfig`
+  authority. Funnel is the public-visibility mode of the same handler used by
+  Serve; the package-owned `ListenFunnel` listener/reverse-proxy path and its
+  separate registries are removed.
+- Every runtime performs one bounded automatic first-`Up` reset when upstream
+  first reaches Running. Package Running and all identity-bound HTTP/TCP/UDP/
+  TLS/Serve/Funnel operations remain gated until it succeeds; failure
+  quarantines and drains the exact generation.
+- ServeConfig writes use one serialized get/copy/apply/ETag transaction with at
+  most three total attempts. Only typed precondition conflicts retry. A result
+  that may have committed without a response closes the generation before the
+  typed `publicationCommitIndeterminate` error is returned.
+- Publication handles carry the exact runtime generation and a unique mapping
+  token. Closing or finalizing a replaced/old-generation handle is an
+  idempotent stale no-op and cannot clear its successor; explicit `clear()`
+  remains a coordinate operation.
+- A confirmed publication remains in native pending-delivery custody until Dart
+  validates and acknowledges its exact handle. Malformed or lost delivery
+  quarantines that runtime, with a bounded native timer covering helper/caller
+  isolate loss so committed ingress cannot silently lose its owner.
+- Each HTTP client's first admission, `tcp.dial`, `diag.ping`, Serve, and
+  Funnel share a 32-call caller-isolate helper cap. Successful HTTP admission
+  proves that exact runtime ready, so later requests avoid helper-isolate churn.
+  Every path retains an exact runtime token, so stale work cannot execute as a
+  replacement.
+- Added opt-in hosted-Tailscale tests for Funnel's tailnet reachability and
+  Serve -> Funnel -> Serve replacement/exact-handle behavior. Both passed
+  serially against hosted Tailscale on 2026-08-10; they also compile and skip
+  without credentials.
+- Added a macOS production-Keybay receipt that enrolls a persistent publisher,
+  leaves Serve active, kills the process with SIGKILL, reopens the same DEK-
+  backed node without an auth key, and continuously probes startup. It passed
+  against hosted Tailscale on 2026-08-10 with the same IP/stable node ID, no
+  stale backend hit before or after package Running, and verified DEK/state-
+  subtree cleanup.
+
+## 0.8.1
+
+Critical Android fix. Anyone running 0.8.0 on Android should upgrade.
+
+**Bug fixes:**
+
+- Android x86_64 apps could crash with `SIGSYS` on the reactor's first poll,
+  before Flutter rendered a frame. Android's app-process seccomp policy denies
+  the legacy `epoll_wait` syscall. `golang.org/x/sys` v0.47.0 now maps
+  `unix.EpollWait` to the permitted `epoll_pwait` syscall on Linux and Android.
+  Reported and diagnosed by @philipreese in #81.
+- Updated `tailscale.com` from v1.100.0 to v1.102.2, including the upstream
+  incoming Funnel regression fix from v1.102.2.
+
+**Internal:**
+
+- CI now cross-builds every shipped Android ABI and gates on a Linux seccomp
+  regression test. A workflow triggered for relevant PRs (and manually for
+  releases) boots a real Android x86_64 app process.
+
+## 0.8.0
+
+Cleanup and consistency release following an architecture-health review.
+
+**Behavior changes:**
+
+- `udp.send()` now throws `ArgumentError`/`RangeError` for an invalid argument —
+  a bad remote port or address, or an oversize payload — instead of
+  `TailscaleUdpException`. This matches the argument-validation behavior of
+  `serve`, `funnel`, and the HTTP client. Errors parsing datagrams received from
+  the network still throw `TailscaleUdpException`.
+
+**Improvements:**
+
+- Status and peer-list failures from a slow or misbehaving backend now carry a
+  structured error code, instead of surfacing as an unclassified error.
+- The HTTP client's request file-descriptor cleanup was unified so a failure
+  mid-request can no longer leak a descriptor or pin a native goroutine
+  (internal hardening; no API change).
+
+**Internal:**
+
+- Deduplicated the Serve/Funnel argument validators into one module; pruned dead
+  LocalAPI error-classification patterns; CI now runs the Go suite under the
+  race detector.
+
+## 0.7.1
+
+Correctness fixes from a follow-up review of the public API, worker lifecycle,
+and non-transport runtime surfaces.
+
+**Bug fixes:**
+
+- A slow or wedged tailscaled could freeze the entire binding: the serve/funnel
+  teardown, and the status/peers reads, made unbounded LocalAPI calls (some
+  while holding the internal lock). Every LocalAPI call is now bounded (default
+  30s), completing the "no unbounded native call" guarantee begun in 0.7.0.
+- Funnel forwarding to a non-root mount (e.g. `funnel.forward(path: '/api')`)
+  now strips the mount prefix before proxying, so the backend receives paths
+  relative to its mount — matching `Serve`.
+- An HTTP client request whose body failed to finalize no longer leaks the
+  request file descriptor or pins a native goroutine.
+- `TailscaleNode.lastSeen` now returns `null` for online / never-tracked peers
+  instead of a placeholder year-1 date.
+- `nodes()`, `whois()`, and `exitNode.useById()` now report argument/state
+  errors through the returned `Future` (so `.catchError`/`await` handle them)
+  instead of throwing synchronously.
+- `exitNode.suggest()` now returns `null` (not an exception) during the brief
+  startup window before the first network check completes.
+- Corrected the `funnel.clear()` doc: Funnel publications are independent of
+  `Serve` and clearing one does not touch the other.
+
+## 0.7.0
+
+The robustness release. Teardown/lifecycle unification across the native
+runtime, bounded native calls, and internal-registry hardening. Supersedes the
+never-published 0.6.0 below, so this is the first published release since
+0.5.0 and carries that section's changes too.
+
+Behavior change to note: `net.dial` and `diag.ping` without an explicit
+timeout now fail after ~30 seconds instead of waiting indefinitely. Pass a
+`timeout` to choose your own bound.
+
+**New:**
+
+- `diag.nodeState()` — a census of the native runtime's internal registries
+  (live listeners, bindings, forwarders, plus the teardown epoch). Intended
+  for leak diagnostics and bug reports: after closing everything, all counts
+  should be zero.
+
+**Bug fixes:**
+
+- A `udp.bind` that fails during Dart-side adoption (e.g. under file-
+  descriptor pressure) no longer leaks its native bridge and tailnet port.
+- Teardown races unified under a single node-epoch gate: a stop/start cycle
+  can no longer resurrect a just-closed listener, binding, or forwarder from
+  a stale asynchronous completion, in any registry.
+
+**Internal:**
+
+- UDP bridge registry keyed by an opaque monotonic id instead of the Dart fd,
+  making fd-reuse displacement structurally impossible.
+- The reactor's peer-reset (RST) delivery contract is now pinned by tests on
+  both platforms: epoll delivers errors unmaskably even with reads paused;
+  kqueue rides them on the read filter. kqueue events now stamp the socket
+  error (diagnostic) from the correct kevent field.
+- `unsafe.Pointer` eliminated from the kqueue poller; CI gates on a fully
+  clean `go vet`; the write-only funnel publication registry is gone.
+
+## 0.6.0 (not published; included in 0.7.0)
+
+The performance/correctness audit release. Crash-safety and leak fixes across
+the UDP/TCP/HTTP data planes, HTTP client/server correctness, funnel/serve
+robustness, a responsive control API (long native calls no longer stall it),
+HTTP connection reuse, and internal reactor fixes. Supersedes the
+never-published 0.5.1, so this carries every change since 0.5.0.
+
+Behavior changes to note: inbound `http.bind` request header names and
+`http.client` response header names are now lowercased (dart:io / shelf
+convention); outbound HTTP requests now reuse pooled connections.
+
+**Bug fixes:**
+
+- UDP datagrams larger than ~2 KiB no longer fail and tear down the binding on
+  macOS/iOS. The datagram socketpair now sizes its buffers like the TCP path, so
+  the advertised 60 KiB payload works on every platform.
+- Closing a UDP binding now reclaims the tailnet port, bridge goroutines, and OS
+  threads instead of leaking them; rebinding the same port immediately after
+  close works.
+- Outbound UDP datagram addresses are parsed as IP literals only, so a hostname
+  can no longer trigger a blocking DNS lookup that stalls the datagram pump.
+- A remote peer resetting a TCP/HTTP connection can no longer crash a
+  root-zone Dart process via an unobserved transport error.
+- `http.client` responses now expose lowercase header names, so `response.body`
+  decodes UTF-8 (and other charsets) correctly instead of defaulting to latin1,
+  and case-insensitive header lookups work.
+- Inbound `http.bind` request headers are likewise exposed with lowercase names,
+  so `request.headers['content-type']` works instead of missing the
+  canonical-cased key.
+- Inbound `http.bind` streaming responses (SSE, long-poll) now flush each chunk
+  to the wire instead of stalling in the server's buffer until it fills.
+- Outbound HTTP responses now carry a real `Content-Length: 0` (was dropped to
+  null) and a bare reason phrase (`OK`, not `200 OK`).
+- `TailscaleHttpRequest.respond()` now closes the request/response transports
+  even if writing the body fails, instead of leaking the fds and Go handler
+  goroutine.
+- Unawaited sequential `TailscaleHttpResponse.write()` calls now reach the wire
+  in call order rather than racing and reordering the body.
+- Hardened the `http.bind` accept loop (crash-safe worker, dead-isolate
+  detection, and fd cleanup for accepts that race `close()`), matching the TCP
+  listener; a TCP accept that loses to `close()` no longer leaks an uncaught
+  error.
+- `funnel.forward` can no longer wedge the whole native API surface (including
+  `stop()`) when the node changes state mid-call.
+- Concurrent `serve.forward`/`serve.clear` calls no longer lose updates (the
+  ServeConfig get-modify-set is serialized); concurrent same-port
+  `funnel.forward` calls fold together instead of one failing with "address in
+  use".
+- A `funnel.forward` racing a concurrent `down()`/`logout()` can no longer
+  strand a funnel forwarder whose listener has died; forwarders are reaped when
+  their listener closes, so a later same-port `funnel.forward` can't attach to a
+  dead listener and silently fail to serve.
+- A `serve.forward` racing a concurrent `down()`/`logout()` can no longer persist
+  a serve mount that survives the stop and silently re-exposes the service on the
+  next `up()`; a forward that arrives once teardown has begun is now refused.
+- The inbound-connection/request identity is dropped if the state watcher dies,
+  so a reassigned tailnet address is never misattributed to the previous node.
+- `up(timeout:)` now bounds the native start step too, not just the wait for a
+  stable state, so it can't block past its budget on a slow/wedged bring-up.
+- `exitNode.onCurrentChange` no longer emits a duplicate first value or a stale
+  value under rapid changes.
+- A socketpair-wrap failure no longer double-closes an fd, and a reactor wake
+  can no longer write into a just-closed poller fd.
+
+**Performance:**
+
+- `tcp.dial`, `diag.ping`, and `serve`/`funnel.forward` no longer block the
+  shared worker isolate for their (potentially multi-second) duration. They run
+  on a short-lived helper isolate, so a slow dial or a funnel waiting on the
+  node to reach Running no longer stalls concurrent `status()`/`nodes()` calls
+  or delays state/peer events. (Measured: a concurrent `status()` during an 8 s
+  dial went from ~7.75 s to ~0 ms.) Fast local calls and awaited lifecycle
+  steps (`up`/`down`/`logout`) stay on the worker. Concurrent offloaded calls
+  are capped so a burst can't spawn unbounded helper isolates.
+- The HTTP client (`http.client`) now reuses one connection pool across requests
+  to the same peer instead of building a fresh transport — a new connection plus
+  a full TLS handshake — on every request. The cached transport is keyed on the
+  node's identity and dropped on teardown, so a pooled connection never outlives
+  a logout/login as a different identity.
+
+**Internal:**
+
+- Reactor shards are assigned round-robin rather than by fd parity (which pinned
+  concurrent flows to one shard); a shard whose first registration fails no
+  longer keeps the process alive; and on Linux a peer half-close no longer spins
+  epoll at 100% CPU while reads are disabled.
+
 ## 0.5.0
 
 A feature and performance release. Inbound connections and HTTP requests now

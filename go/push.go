@@ -12,13 +12,13 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 	"unsafe"
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
-	"tailscale.com/ipn/ipnstate"
 )
 
 // peerPublishDebounce coalesces rapid NetMap deltas into a single
@@ -30,16 +30,37 @@ const peerPublishDebounce = 100 * time.Millisecond
 var (
 	dartPort   C.Dart_Port_DL
 	dartPortMu sync.Mutex
-
-	// watchMu guards watchCancel + publishTimer. StartWatch /
-	// StopWatch are normally called serially from the Dart worker
-	// isolate, but the mutex keeps the invariant explicit so a
-	// future caller can't race us into a double-free on the
-	// cancel func.
-	watchMu      sync.Mutex
-	watchCancel  context.CancelFunc
-	publishTimer *time.Timer
 )
+
+type watcherRun struct {
+	runtime      *nodeRuntime
+	generation   uint64
+	runtimeToken uint64
+	ctx          context.Context
+	cancel       context.CancelFunc
+	done         chan struct{}
+	doneOnce     sync.Once
+	publishWG    sync.WaitGroup
+	timer        *time.Timer // guarded by runtime.watchMu
+	post         func(map[string]any)
+}
+
+func (run *watcherRun) finish() {
+	run.doneOnce.Do(func() { close(run.done) })
+}
+
+// watcherRunCurrentLocked reports whether run still owns its runtime's watch
+// slot and its generation is still live. Callers hold run.runtime.watchMu —
+// the per-runtime watcher publication barrier: a watcher must pass this check
+// while holding that lock to publish into Dart or replace the identity cache,
+// and stopWatch clears ownership under the same lock before joining.
+func watcherRunCurrentLocked(run *watcherRun) bool {
+	return run != nil &&
+		run.runtime != nil &&
+		run.runtime.watch == run &&
+		run.ctx.Err() == nil &&
+		nodeEpoch.Load() == run.generation
+}
 
 // InitializeDartAPI must be called once with NativeApi.initializeApiDLData.
 func InitializeDartAPI(data unsafe.Pointer) bool {
@@ -56,174 +77,299 @@ func SetDartPort(port int64) {
 // StartWatch begins watching tsnet state changes and posting to Dart.
 // Must be called after Start() succeeds.
 func StartWatch() {
-	mu.Lock()
-	s := srv
-	mu.Unlock()
-	if s == nil {
+	runtime := currentRuntime()
+	if runtime == nil {
 		return
 	}
+	runtime.stopWatch()
 
-	lc, err := s.LocalClient()
-	if err != nil {
-		postMessage(map[string]any{
-			"type":  "error",
-			"code":  "localClient",
-			"error": err.Error(),
-		})
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Cancel any previous watcher.
-	watchMu.Lock()
-	if watchCancel != nil {
-		watchCancel()
-	}
-	watchCancel = cancel
-	watchMu.Unlock()
-
+	lc := runtime.localClient
+	ctx, cancel := context.WithCancel(runtime.ctx)
 	watcher, err := lc.WatchIPNBus(ctx,
 		ipn.NotifyInitialState|ipn.NotifyInitialNetMap)
 	if err != nil {
-		postMessage(map[string]any{
-			"type":  "error",
-			"code":  "watcher",
-			"error": err.Error(),
-		})
+		if !failPublicationBootstrap(runtime, fmt.Errorf("start state watcher: %w", err)) {
+			postRuntimeWatcherMessage(runtime, map[string]any{
+				"type":         "error",
+				"runtimeToken": runtime.token,
+				"code":         "watcher",
+				"error":        err.Error(),
+			})
+		}
 		cancel()
 		return
 	}
+	run := &watcherRun{
+		runtime:      runtime,
+		generation:   runtime.generation,
+		runtimeToken: runtime.token,
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		post:         postMessage,
+	}
+
+	runtime.watchMu.Lock()
+	if runtime.validateCurrent() != nil {
+		runtime.watchMu.Unlock()
+		cancel()
+		_ = watcher.Close()
+		return
+	}
+	previous := runtime.watch
+	runtime.watch = run
+	if previous != nil {
+		previous.cancel()
+		stopWatcherTimerLocked(previous)
+	}
+	// A replacement watcher starts this runtime's index cold while it waits for
+	// its initial netmap. A successor runtime owns a distinct index.
+	runtime.identity.invalidate()
+	runtime.watchMu.Unlock()
 
 	go func() {
+		defer finishWatcherRun(run)
 		defer watcher.Close()
 		for {
 			n, err := watcher.Next()
 			if err != nil {
-				// Context cancelled = normal shutdown, don't report.
-				if ctx.Err() == nil {
-					postMessage(map[string]any{
-						"type":  "error",
-						"code":  "watcher",
-						"error": err.Error(),
+				// A non-cancel error means this watcher is dying while still
+				// active. Invalidate the identity index so accept-time lookups
+				// fall back to a live WhoIs instead of using a frozen netmap.
+				runtime.watchMu.Lock()
+				current := watcherRunCurrentLocked(run)
+				preReady := current && !runtime.publication.bootstrapReady()
+				if current {
+					runtime.identity.invalidate()
+				}
+				if preReady {
+					// Make an Up success racing this watcher failure observe lost
+					// ownership before it can release readiness.
+					run.cancel()
+				}
+				runtime.watchMu.Unlock()
+				if preReady {
+					_ = failPublicationBootstrap(runtime, fmt.Errorf("state watcher stopped before readiness: %w", err))
+					return
+				}
+				// Context cancellation and supersession are normal shutdown.
+				if current {
+					postWatcherMessage(run, map[string]any{
+						"type":         "error",
+						"runtimeToken": run.runtimeToken,
+						"code":         "watcher",
+						"error":        err.Error(),
 					})
 				}
 				return
 			}
 
 			if n.State != nil {
-				postMessage(map[string]any{
-					"type":  "status",
-					"state": n.State.String(),
-				})
+				handleWatcherState(run, *n.State)
 			}
 			if n.ErrMessage != nil {
-				postMessage(map[string]any{
-					"type":  "error",
-					"code":  "node",
-					"error": *n.ErrMessage,
+				postWatcherMessage(run, map[string]any{
+					"type":         "error",
+					"runtimeToken": run.runtimeToken,
+					"code":         "node",
+					"error":        *n.ErrMessage,
 				})
 			}
 			if n.NetMap != nil {
-				// Mirror the netmap into the accept-path identity cache before
-				// the debounced peer publish: identity must be fresh the moment
-				// a connection is accepted, whereas the Dart peer snapshot can
-				// coalesce. Build outside watchMu, then apply only while this
-				// watcher's ctx is live. StopWatch cancels ctx and invalidates
-				// under watchMu, so gating the swap the same way stops an
-				// in-flight tick from re-warming a torn-down cache.
+				// Identity must be fresh immediately, while the Dart peer snapshot
+				// can be debounced. Build outside the lock and commit only if this
+				// watcher still owns the current generation.
 				idx := buildIdentityIndex(n.NetMap)
-				watchMu.Lock()
-				if ctx.Err() == nil {
-					identityCache.replace(idx)
+				runtime.watchMu.Lock()
+				if watcherRunCurrentLocked(run) {
+					runtime.identity.replace(idx)
 				}
-				watchMu.Unlock()
-				schedulePeerPublish(ctx, lc)
+				runtime.watchMu.Unlock()
+				schedulePeerPublish(run, lc)
 			}
 		}
 	}()
+
+	// Concurrent replacement is not expected from Dart, but if it occurs,
+	// StartWatch does not return while the displaced watcher can still publish.
+	if previous != nil {
+		<-previous.done
+		previous.publishWG.Wait()
+	}
 }
 
-// schedulePeerPublish debounces publishPeerSnapshot so a burst of
-// NetMap deltas (endpoint reshuffles, relay flaps, etc.) collapses
-// into a single serialize-and-push. Called from the IPN bus watcher
-// goroutine on every NetMap tick; only the last tick in a
-// peerPublishDebounce-width window actually produces a message.
-func schedulePeerPublish(ctx context.Context, lc *local.Client) {
-	watchMu.Lock()
-	defer watchMu.Unlock()
-	if publishTimer != nil {
-		publishTimer.Stop()
+func handleWatcherState(run *watcherRun, state ipn.State) {
+	suppress, bootstrap := run.runtime.publication.observeState(state)
+	if bootstrap != nil {
+		// The watcher can attach after a fast reconnect has already reached
+		// Running. Publish the masked state before starting the bootstrap so
+		// Starting always precedes its synthetic Running completion.
+		postWatcherMessage(run, map[string]any{
+			"type":         "status",
+			"runtimeToken": run.runtimeToken,
+			"state":        ipn.Starting.String(),
+		})
+		go runPublicationBootstrap(run.runtime, run, bootstrap)
 	}
-	publishTimer = time.AfterFunc(peerPublishDebounce, func() {
-		// Re-check cancellation: StopWatch may have fired after the
-		// timer was armed and before it ran.
-		if ctx.Err() != nil {
-			return
-		}
-		publishPeerSnapshot(ctx, lc)
+	if !suppress {
+		postWatcherMessage(run, map[string]any{
+			"type":         "status",
+			"runtimeToken": run.runtimeToken,
+			"state":        state.String(),
+		})
+	}
+}
+
+// schedulePeerPublish debounces publishPeerSnapshot so a burst of NetMap
+// deltas collapses into a single serialize-and-push.
+func schedulePeerPublish(run *watcherRun, lc *local.Client) {
+	run.runtime.watchMu.Lock()
+	defer run.runtime.watchMu.Unlock()
+	if !watcherRunCurrentLocked(run) {
+		return
+	}
+	scheduleWatcherTimerLocked(run, peerPublishDebounce, func() {
+		publishPeerSnapshot(run, lc)
 	})
 }
 
-// publishPeerSnapshot fetches the current peer list via LocalAPI and
-// pushes it to Dart. Dedup/distinct is left to Dart subscribers.
-func publishPeerSnapshot(ctx context.Context, lc *local.Client) {
-	status, err := lc.Status(ctx)
-	if err != nil {
-		// Non-fatal — the app will pick up the next NetMap tick.
+// scheduleWatcherTimerLocked replaces a run's pending debounce callback while
+// accounting for callbacks that have already fired. Callers must hold the
+// run's runtime.watchMu.
+func scheduleWatcherTimerLocked(run *watcherRun, delay time.Duration, callback func()) {
+	stopWatcherTimerLocked(run)
+	run.publishWG.Add(1)
+	run.timer = time.AfterFunc(delay, func() {
+		defer run.publishWG.Done()
+		callback()
+	})
+}
+
+// stopWatcherTimerLocked releases the callback count itself only when Stop
+// proves the callback never started. A false result means it is running or has
+// already called Done. Callers must hold the run's runtime.watchMu.
+func stopWatcherTimerLocked(run *watcherRun) {
+	if run == nil || run.timer == nil {
 		return
 	}
-	peers := make([]*ipnstate.PeerStatus, 0, len(status.Peer))
-	for _, peer := range status.Peer {
-		peers = append(peers, peer)
+	if run.timer.Stop() {
+		run.publishWG.Done()
 	}
-	ipnstate.SortPeers(peers)
+	run.timer = nil
+}
+
+// publishPeerSnapshot fetches the current peer list via LocalAPI and pushes it
+// to Dart. The final post is gated again because Status may complete late.
+func publishPeerSnapshot(run *watcherRun, lc *local.Client) {
+	status, err := lc.Status(run.ctx)
+	if err != nil {
+		return
+	}
+	peers := sortedPeers(status)
 	body, err := json.Marshal(peers)
 	if err != nil {
 		return
 	}
-	postMessage(map[string]any{
-		"type":  "peers",
-		"peers": json.RawMessage(body),
+	postWatcherMessage(run, map[string]any{
+		"type":         "peers",
+		"runtimeToken": run.runtimeToken,
+		"peers":        json.RawMessage(body),
 	})
 }
 
-// StopWatch cancels the state watcher goroutine and drains any
-// pending debounced peer publish.
+// postWatcherMessage performs the final owner, cancellation, and generation
+// check at the Dart boundary. Holding the runtime's watchMu through the post
+// makes stopWatch a publication barrier: after it detaches a run, no delayed
+// result can escape.
+func postWatcherMessage(run *watcherRun, msg map[string]any) bool {
+	run.runtime.watchMu.Lock()
+	defer run.runtime.watchMu.Unlock()
+	if !watcherRunCurrentLocked(run) {
+		return false
+	}
+	if _, ok := msg["runtimeToken"]; !ok {
+		msg["runtimeToken"] = run.runtimeToken
+	}
+	post := run.post
+	if post == nil {
+		post = postMessage
+	}
+	post(msg)
+	return true
+}
+
+func postRuntimeWatcherMessage(runtime *nodeRuntime, msg map[string]any) bool {
+	runtime.watchMu.Lock()
+	defer runtime.watchMu.Unlock()
+	if runtime == nil || runtime.validateCurrent() != nil {
+		return false
+	}
+	if _, ok := msg["runtimeToken"]; !ok {
+		msg["runtimeToken"] = runtime.token
+	}
+	postMessage(msg)
+	return true
+}
+
+func finishWatcherRun(run *watcherRun) {
+	// Abort any LocalAPI request in a fired debounce callback before joining it.
+	run.cancel()
+	runtime := run.runtime
+	runtime.watchMu.Lock()
+	if runtime.watch == run {
+		stopWatcherTimerLocked(run)
+		runtime.identity.invalidate()
+	}
+	runtime.watchMu.Unlock()
+
+	// done covers the complete production watcher lifetime: the IPN loop and
+	// every debounce callback that actually began have returned.
+	run.publishWG.Wait()
+
+	// Keep a naturally exiting run discoverable until callbacks drain, so a
+	// concurrent stopWatch can still join it.
+	runtime.watchMu.Lock()
+	if runtime.watch == run {
+		runtime.watch = nil
+	}
+	run.finish()
+	runtime.watchMu.Unlock()
+}
+
+// StopWatch stops the current runtime's state watcher, if any. External
+// callers (the FFI export, benchmarks) address whatever runtime is current;
+// internal teardown uses the runtime method directly because it runs after
+// detach, when currentRuntime is already nil.
 func StopWatch() {
-	watchMu.Lock()
-	defer watchMu.Unlock()
-	if watchCancel != nil {
-		watchCancel()
-		watchCancel = nil
+	if runtime := currentRuntime(); runtime != nil {
+		runtime.stopWatch()
 	}
-	if publishTimer != nil {
-		publishTimer.Stop()
-		publishTimer = nil
-	}
-	// Once we stop receiving netmap ticks the cache can drift from the live
-	// netmap; mark it cold so accept-time lookups fall back to a live WhoIs.
-	identityCache.invalidate()
 }
 
-// publishState posts a synthetic state-change event to Dart subscribers.
-//
-// Used by lib.go's Stop() and Logout() to notify subscribers that the engine
-// has transitioned to Stopped / NoState respectively. tsnet.Server.Close()
-// doesn't emit a terminal state through the IPN bus — WatchIPNBus just sees
-// an error and the goroutine exits silently — so without this, callers that
-// mirror state via onStateChange (e.g. the Dart TailscaleClient) get stuck
-// at the pre-stop value (usually `Running`) and their UI routing goes
-// stale.
-//
-// `state` must be one of the strings accepted by NodeState.parse on the Dart
-// side ("NoState", "NeedsLogin", "NeedsMachineAuth", "Starting", "Running",
-// "Stopped").
-func publishState(state string) {
-	postMessage(map[string]any{
-		"type":  "status",
-		"state": state,
-	})
+// stopWatch cancels this runtime's state watcher and joins both its IPN loop
+// and every debounce callback that could publish a delayed peer snapshot.
+// Runs from closeOwnedResources after detach, so it must not resolve
+// currentRuntime.
+func (r *nodeRuntime) stopWatch() {
+	r.watchMu.Lock()
+	run := r.watch
+	r.watch = nil
+	if run != nil {
+		run.cancel()
+		stopWatcherTimerLocked(run)
+	}
+	// Invalidate before releasing the barrier so no accept path can consume an
+	// old generation's identity index while watcher teardown drains.
+	r.identity.invalidate()
+	r.watchMu.Unlock()
+
+	if run == nil {
+		return
+	}
+	<-run.done
+	// Real watcher completion already includes this wait; keep it explicit for
+	// callers/tests that supply the two completion sources independently.
+	run.publishWG.Wait()
 }
 
 func postMessage(msg map[string]any) {

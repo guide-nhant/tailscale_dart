@@ -13,13 +13,31 @@ import 'identity.dart';
 
 const int _udpEnvelopeVersion = 1;
 const int _udpEnvelopeHeaderBytes = 4;
+const int _udpMaxAddressBytes = 255;
 
 /// Maximum public UDP payload accepted by the v1 package-native transport.
 const int tailscaleMaxDatagramPayloadBytes = 60 * 1024;
 
+/// Largest wire envelope: header + max address + max payload. The datagram
+/// transport must read into a buffer at least this large, or a short read(2)
+/// would truncate the datagram (which the length-free envelope cannot detect).
+/// Must mirror `udpMaxEnvelopeBytes` in go/udp_fd_posix.go.
+const int _udpMaxEnvelopeBytes =
+    _udpEnvelopeHeaderBytes +
+    _udpMaxAddressBytes +
+    tailscaleMaxDatagramPayloadBytes;
+
 typedef UdpBindFn =
-    Future<({int fd, TailscaleEndpoint local})> Function(String host, int port);
-typedef UdpDefaultAddressFn = Future<String?> Function();
+    Future<({int fd, int bindingId, TailscaleEndpoint local})> Function(
+      String host,
+      int port,
+    );
+
+/// Tears down the Go-side UDP bridge for the given opaque binding id (from the
+/// bind response). A datagram socketpair peer-close does not wake the Go
+/// bridge's reader, so the binding must signal Go explicitly on close, or the
+/// port + goroutines + threads leak.
+typedef UdpCloseFn = Future<void> Function(int bindingId);
 
 /// One UDP datagram received over the tailnet.
 final class TailscaleDatagram {
@@ -115,25 +133,36 @@ abstract class Udp {
 
 /// Library-internal factory. Reach via `Tailscale.instance.udp`.
 @internal
-Udp createUdp({
-  required UdpBindFn bindFn,
-  required UdpDefaultAddressFn defaultAddressFn,
-}) => _Udp(bindFn, defaultAddressFn);
+Udp createUdp({required UdpBindFn bindFn, required UdpCloseFn closeFn}) =>
+    _Udp(bindFn, closeFn);
 
 @internal
 Future<TailscaleDatagramBinding> createFdTailscaleDatagramBinding({
   required int fd,
+  required int bindingId,
   required TailscaleEndpoint local,
+  UdpCloseFn? closeFn,
 }) async {
-  final transport = await PosixFdTransport.adopt(fd);
-  return _FdTailscaleDatagramBinding(transport: transport, local: local);
+  // Datagram mode: preserve message boundaries and read into a full-envelope
+  // buffer so the reactor never truncates a datagram under queue backpressure.
+  final transport = await PosixFdTransport.adopt(
+    fd,
+    datagram: true,
+    maxReadChunkSize: _udpMaxEnvelopeBytes,
+  );
+  return _FdTailscaleDatagramBinding(
+    transport: transport,
+    bindingId: bindingId,
+    local: local,
+    closeFn: closeFn,
+  );
 }
 
 final class _Udp implements Udp {
-  const _Udp(this._bind, this._defaultAddress);
+  const _Udp(this._bind, this._close);
 
   final UdpBindFn _bind;
-  final UdpDefaultAddressFn _defaultAddress;
+  final UdpCloseFn _close;
 
   @override
   Future<TailscaleDatagramBinding> bind({
@@ -143,15 +172,27 @@ final class _Udp implements Udp {
     if (Platform.isWindows) {
       throw const TailscaleUdpException('Windows is not supported.');
     }
-    final resolvedAddress = address ?? await _defaultAddress();
-    if (resolvedAddress == null || resolvedAddress.isEmpty) {
-      throw const TailscaleUdpException(
-        'udp.bind requires a local tailnet address before this node has IPv4.',
-      );
-    }
+    final resolvedAddress = address ?? '';
     try {
-      final (:fd, :local) = await _bind(resolvedAddress, port);
-      return createFdTailscaleDatagramBinding(fd: fd, local: local);
+      final (:fd, :bindingId, :local) = await _bind(resolvedAddress, port);
+      try {
+        return await createFdTailscaleDatagramBinding(
+          fd: fd,
+          bindingId: bindingId,
+          local: local,
+          closeFn: _close,
+        );
+      } catch (e) {
+        // Adoption failed (e.g. reactor registration) AFTER Go committed a
+        // live bridge; the adopt path already closed the raw fd, but the Go
+        // side (two pump goroutines + the bound tailnet port) has no other
+        // reclaim path and would leak until the node stops. Best-effort close
+        // by id, then surface the original failure.
+        try {
+          await _close(bindingId);
+        } catch (_) {}
+        rethrow;
+      }
     } catch (e) {
       if (e is TailscaleUdpException) rethrow;
       throw TailscaleUdpException(
@@ -169,14 +210,19 @@ final class _Udp implements Udp {
     if (Platform.isWindows) {
       throw const TailscaleUdpException('Windows is not supported.');
     }
-    final resolvedAddress = address ?? await _defaultAddress();
-    if (resolvedAddress == null || resolvedAddress.isEmpty) {
-      throw const TailscaleUdpException(
-        'udp.bindFd requires a local tailnet address before this node has IPv4.',
-      );
-    }
+    // Same contract as [bind]: a null/empty address lets the Go side pick
+    // this node's tailnet address (callers such as LumeN's socket factory
+    // pass null for a wildcard bind and rely on that default).
+    final resolvedAddress = address ?? '';
     try {
-      final (:fd, :local) = await _bind(resolvedAddress, port);
+      // fd ownership transfers to the caller (see TailscaleFdEndpoint); the
+      // runtime does not adopt the fd into a datagram-binding wrapper. NB:
+      // `_bind` still allocates a Go-side bridge keyed by `bindingId`, and per
+      // UdpCloseFn a datagram socketpair peer-close does NOT wake that bridge —
+      // so closing the fd alone leaks the Go port/goroutines until the node
+      // stops. A leak-free raw UDP fd needs TailscaleFdEndpoint to carry the
+      // bindingId (or a detached-fd Go path); left to the maintainer.
+      final (:fd, :local, bindingId: _) = await _bind(resolvedAddress, port);
       return TailscaleFdEndpoint(fd: fd, local: local);
     } catch (e) {
       if (e is TailscaleUdpException) rethrow;
@@ -191,8 +237,12 @@ final class _Udp implements Udp {
 final class _FdTailscaleDatagramBinding implements TailscaleDatagramBinding {
   _FdTailscaleDatagramBinding({
     required PosixFdTransport transport,
+    required int bindingId,
     required this.local,
-  }) : _transport = transport {
+    UdpCloseFn? closeFn,
+  }) : _transport = transport,
+       _bindingId = bindingId,
+       _closeFn = closeFn {
     _datagrams = StreamController<TailscaleDatagram>(onCancel: close);
     _subscription = _transport.input.listen(
       _handleEnvelope,
@@ -208,9 +258,15 @@ final class _FdTailscaleDatagramBinding implements TailscaleDatagramBinding {
         },
       ),
     );
+    // `_completeDone`/`close()` can complete `done` with an error; absorb the
+    // orphaned completion so a caller that never awaits `done` can't leak an
+    // unhandled async error. Awaiters still observe it.
+    _done.future.ignore();
   }
 
   final PosixFdTransport _transport;
+  final int _bindingId;
+  final UdpCloseFn? _closeFn;
   late final StreamController<TailscaleDatagram> _datagrams;
   late final StreamSubscription<Uint8List> _subscription;
   final _done = Completer<void>();
@@ -243,6 +299,21 @@ final class _FdTailscaleDatagramBinding implements TailscaleDatagramBinding {
     } catch (error, stackTrace) {
       closeError = error;
       closeStackTrace = stackTrace;
+    }
+    // Tear down the Go-side bridge before releasing the fd. A datagram
+    // socketpair peer-close won't wake the Go reader, so without this the
+    // tailnet port, both bridge goroutines, and two OS threads leak. Keyed by
+    // the opaque binding id, so fd reuse can never misdirect the close; the
+    // bridge-then-transport order stays so Go stops pumping before the fd
+    // disappears under it.
+    final closeFn = _closeFn;
+    if (closeFn != null) {
+      try {
+        await closeFn(_bindingId);
+      } catch (error, stackTrace) {
+        closeError ??= error;
+        closeStackTrace ??= stackTrace;
+      }
     }
     try {
       await _transport.close();
@@ -297,21 +368,31 @@ final class _FdTailscaleDatagramBinding implements TailscaleDatagramBinding {
 }
 
 Uint8List _encodeDatagramEnvelope(TailscaleEndpoint remote, List<int> payload) {
+  // Caller-argument validation uses ArgumentError/RangeError (as serve, funnel,
+  // and http do) — these signal a bad value the caller passed, not an
+  // operational failure. Wire-parsing errors in _decodeDatagramEnvelope stay
+  // TailscaleUdpException.
   if (remote.address.isEmpty) {
-    throw const TailscaleUdpException('remote address is required');
+    throw ArgumentError.value(remote.address, 'remote.address', 'is required');
   }
   if (remote.port < 1 || remote.port > 65535) {
-    throw TailscaleUdpException('invalid remote UDP port ${remote.port}');
+    throw RangeError.range(remote.port, 1, 65535, 'remote.port');
   }
   if (payload.length > tailscaleMaxDatagramPayloadBytes) {
-    throw TailscaleUdpException(
-      'UDP payload exceeds $tailscaleMaxDatagramPayloadBytes bytes',
+    throw ArgumentError.value(
+      payload.length,
+      'payload',
+      'exceeds $tailscaleMaxDatagramPayloadBytes bytes',
     );
   }
 
   final address = utf8.encode(remote.address);
   if (address.length > 255) {
-    throw const TailscaleUdpException('remote address is too long');
+    throw ArgumentError.value(
+      remote.address,
+      'remote.address',
+      'is too long (max 255 encoded bytes)',
+    );
   }
 
   final envelope = Uint8List(

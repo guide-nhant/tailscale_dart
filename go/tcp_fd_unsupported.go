@@ -4,19 +4,27 @@ package tailscale
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"time"
 )
 
-func TcpDialFd(host string, port int, timeout time.Duration) (*TcpFdConn, error) {
+func TcpDialFd(runtimeToken uint64, host string, port int, timeout time.Duration) (*TcpFdConn, error) {
+	if _, ok := acquireNodeGateForRuntimeToken(runtimeToken); !ok {
+		return nil, fmt.Errorf(
+			"%w: TcpDialFd captured runtime %d is no longer current",
+			ErrRuntimeStale,
+			runtimeToken,
+		)
+	}
 	return nil, errors.New("TcpDialFd is not supported on Windows")
 }
 
-func TcpListenFd(tailnetPort int, tailnetHost string) (*TcpFdListener, error) {
+func TcpListenFd(runtimeToken uint64, tailnetPort int, tailnetHost string) (*TcpFdListener, error) {
 	return nil, errors.New("TcpListenFd is not supported on Windows")
 }
 
-func TlsListenFd(tailnetPort int, tailnetHost string) (*TcpFdListener, error) {
+func TlsListenFd(runtimeToken uint64, tailnetPort int, tailnetHost string) (*TcpFdListener, error) {
 	return nil, errors.New("TlsListenFd is not supported on Windows")
 }
 
@@ -25,9 +33,6 @@ func TcpAcceptFd(listenerID int64) (*TcpFdConn, bool, error) {
 }
 
 func TcpCloseFdListener(listenerID int64) {
-}
-
-func closeAllTcpFdListeners() {
 }
 
 func newSocketPairConn() (int, net.Conn, error) {

@@ -13,6 +13,90 @@ library;
 /// [LocalAPI](https://pkg.go.dev/tailscale.com/client/local) surface
 /// exposes (e.g. `IsAccessDeniedError`, `IsPreconditionsFailedError`).
 enum TailscaleErrorCode {
+  /// Another start/stop transition currently owns the process lifecycle.
+  lifecycleBusy,
+
+  /// Native teardown or state cleanup failed; restart before further use.
+  runtimeCleanupFailed,
+
+  /// Immutable active-runtime configuration differs from the request.
+  configurationMismatch,
+
+  /// The operation belongs to a node runtime that has already stopped.
+  staleRuntime,
+
+  /// The node has not completed its Running/publication bootstrap gate.
+  dataPlaneNotReady,
+
+  /// The mandatory first-Up publication reset failed for this runtime.
+  publicationBootstrapFailure,
+
+  /// ServeConfig changed during all bounded mutation attempts.
+  serveConfigConflict,
+
+  /// The publication mutation conclusively did not reach ServeConfig.
+  publicationNotApplied,
+
+  /// A ServeConfig mutation may have applied before its result was lost.
+  publicationCommitIndeterminate,
+
+  /// Native startup was quarantined before it could publish a runtime.
+  startupAbandoned,
+
+  /// Another process or isolate owns the persistent StateStore lease.
+  stateLeaseBusy,
+
+  /// The persistent StateStore DEK was not exactly 32 raw bytes.
+  invalidStateKey,
+
+  /// An encrypted state envelope exists but its Keybay DEK is absent.
+  missingStateKey,
+
+  /// Keybay contains a DEK but the corresponding state envelope is absent.
+  orphanedStateKey,
+
+  /// A previously authorized local reset has not completed.
+  localResetIncomplete,
+
+  /// Legacy plaintext SQLite/FileStore and encrypted artifacts coexist.
+  conflictingStateFormats,
+
+  /// A pre-launch plaintext SQLite/FileStore requires explicit local forget.
+  legacyStateUnsupported,
+
+  /// The package state subtree contains unrecognized residual files.
+  unexpectedStateResidue,
+
+  /// An interrupted atomic envelope write could not be safely recovered.
+  atomicPersistenceFailure,
+
+  /// The Keybay key did not authenticate the encrypted envelope.
+  stateAuthenticationFailed,
+
+  /// The encrypted envelope uses a newer or unsupported format tuple.
+  unsupportedStateFormat,
+
+  /// The encrypted envelope or its security metadata is malformed.
+  invalidStateFormat,
+
+  /// The platform keystore is locked or requires unavailable interaction.
+  secureStorageLocked,
+
+  /// Keybay cannot safely access its platform-protected container.
+  secureStorageUnavailable,
+
+  /// Another live writer currently owns Keybay's mutation lock.
+  secureStorageBusy,
+
+  /// The caller deadline expired and the matching runtime was quarantined.
+  startupTimeout,
+
+  /// Upstream logout may have completed; local recovery evidence was retained.
+  logoutIndeterminate,
+
+  /// The supervised control isolate exited unexpectedly.
+  workerTerminated,
+
   /// Target does not exist (unknown node, waiting file, profile, route...).
   notFound,
 
@@ -59,6 +143,12 @@ sealed class TailscaleException implements Exception {
 /// Thrown when the API is used in an invalid lifecycle state.
 final class TailscaleUsageException extends TailscaleException {
   const TailscaleUsageException(super.message, {super.cause});
+}
+
+/// Thrown when `Tailscale.init` conflicts with the process-wide state root or
+/// logging configuration already frozen by an earlier successful call.
+final class TailscaleConfigurationException extends TailscaleException {
+  const TailscaleConfigurationException(super.message, {super.cause});
 }
 
 /// Base class for operation-specific failures such as `up()` or `listen()`.
@@ -161,7 +251,7 @@ final class TailscaleStatusException extends TailscaleOperationException {
   }) : super('status', message);
 }
 
-/// Thrown when `logout()` fails to clear persisted state.
+/// Thrown when `logout()` cannot confirm remote revocation or local cleanup.
 final class TailscaleLogoutException extends TailscaleOperationException {
   const TailscaleLogoutException(
     String message, {
@@ -171,14 +261,15 @@ final class TailscaleLogoutException extends TailscaleOperationException {
   }) : super('logout', message);
 }
 
-/// Thrown when a `taildrop.*` call fails.
-final class TailscaleTaildropException extends TailscaleOperationException {
-  const TailscaleTaildropException(
+/// Thrown when explicit local identity destruction cannot be completed.
+final class TailscaleForgetLocalIdentityException
+    extends TailscaleOperationException {
+  const TailscaleForgetLocalIdentityException(
     String message, {
     super.code,
     super.statusCode,
     super.cause,
-  }) : super('taildrop', message);
+  }) : super('forget local identity', message);
 }
 
 /// Thrown when a `serve.*` call fails — most notably a conflicting
@@ -213,16 +304,6 @@ final class TailscalePrefsException extends TailscaleOperationException {
   }) : super('prefs', message);
 }
 
-/// Thrown when a `profiles.*` call fails.
-final class TailscaleProfilesException extends TailscaleOperationException {
-  const TailscaleProfilesException(
-    String message, {
-    super.code,
-    super.statusCode,
-    super.cause,
-  }) : super('profiles', message);
-}
-
 /// Thrown when an `exitNode.*` call fails.
 final class TailscaleExitNodeException extends TailscaleOperationException {
   const TailscaleExitNodeException(
@@ -244,13 +325,32 @@ final class TailscaleDiagException extends TailscaleOperationException {
 }
 
 /// High-level category for asynchronous runtime errors pushed from Go.
-enum TailscaleRuntimeErrorCode { localClient, watcher, node, unknown }
+enum TailscaleRuntimeErrorCode {
+  localClient,
+  watcher,
+  node,
+  worker,
+
+  /// The runtime's mandatory first-Up publication reset failed fatally.
+  publicationBootstrapFailure,
+
+  /// A committed publication could not be transferred to an exact Dart
+  /// handle, so native quarantined the runtime rather than leave live ingress.
+  publicationDeliveryFailure,
+
+  unknown,
+}
 
 TailscaleRuntimeErrorCode _parseRuntimeErrorCode(String? value) =>
     switch (value) {
       'localClient' => TailscaleRuntimeErrorCode.localClient,
       'watcher' => TailscaleRuntimeErrorCode.watcher,
       'node' => TailscaleRuntimeErrorCode.node,
+      'worker' => TailscaleRuntimeErrorCode.worker,
+      'publicationBootstrapFailure' =>
+        TailscaleRuntimeErrorCode.publicationBootstrapFailure,
+      'publicationDeliveryFailure' =>
+        TailscaleRuntimeErrorCode.publicationDeliveryFailure,
       _ => TailscaleRuntimeErrorCode.unknown,
     };
 

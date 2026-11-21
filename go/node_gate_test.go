@@ -1,0 +1,459 @@
+//go:build !windows
+
+package tailscale
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"golang.org/x/sys/unix"
+	"tailscale.com/tsnet"
+)
+
+func newFakeTransport() *http.Transport { return &http.Transport{} }
+
+// withLiveServer publishes a runtime around [s] for the test and restores the
+// prior controller state afterward.
+func withLiveServer(t *testing.T, s *tsnet.Server, configs ...runtimeConfig) {
+	t.Helper()
+	config := runtimeConfig{}
+	if len(configs) != 0 {
+		config = configs[0]
+	}
+	runtime := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), config)
+	runtime.server = s
+	runtimes.mu.Lock()
+	prev := runtimes.current
+	if runtimes.candidate != nil || runtimes.draining != nil {
+		runtimes.mu.Unlock()
+		t.Fatal("test cannot publish a runtime during a lifecycle transition")
+	}
+	runtimes.current = runtime
+	runtimes.mu.Unlock()
+	t.Cleanup(func() {
+		runtimes.mu.Lock()
+		runtimes.current = prev
+		runtimes.mu.Unlock()
+		runtime.cancel()
+		runtime.finishPreparation()
+	})
+}
+
+// liveGate acquires a nodeGate against a fake live server, failing the test if
+// no gate is available.
+func liveGate(t *testing.T) nodeGate {
+	t.Helper()
+	gate, ok := acquireNodeGate()
+	if !ok {
+		t.Fatal("acquireNodeGate must succeed while a live server is published")
+	}
+	return gate
+}
+
+// bumpEpoch simulates the lifecycle transition runtimeController performs, without a
+// full teardown (the per-registry sweeps are exercised separately).
+func bumpEpoch() { nodeEpoch.Add(1) }
+
+func TestAcquireNodeGate_RequiresLiveServer(t *testing.T) {
+	if _, ok := acquireNodeGate(); ok {
+		t.Fatal("acquireNodeGate must refuse when no server is running")
+	}
+	withLiveServer(t, &tsnet.Server{})
+	gate := liveGate(t)
+	if !gate.stillCurrent() {
+		t.Fatal("a just-acquired gate must be current")
+	}
+}
+
+func TestAcquireNodeGateForRuntimeTokenRejectsSupersededRuntime(t *testing.T) {
+	superseded := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+	t.Cleanup(superseded.cancel)
+	withLiveServer(t, &tsnet.Server{})
+	replacement := currentRuntime()
+	if replacement == nil || replacement.token == superseded.token {
+		t.Fatal("test requires distinct superseded and replacement runtime tokens")
+	}
+
+	if _, ok := acquireNodeGateForRuntimeToken(0); ok {
+		t.Fatal("zero runtime token acquired the replacement runtime")
+	}
+	if _, ok := acquireNodeGateForRuntimeToken(superseded.token); ok {
+		t.Fatal("superseded runtime token acquired the replacement runtime")
+	}
+	gate, ok := acquireNodeGateForRuntimeToken(replacement.token)
+	if !ok || gate.runtime != replacement || gate.s != replacement.server {
+		t.Fatalf("replacement token gate = %+v, ok=%v; want exact replacement", gate, ok)
+	}
+}
+
+func TestNodeGenerationIsNeverZero(t *testing.T) {
+	if generation := nodeEpoch.Load(); generation == 0 {
+		t.Fatal("node generation zero is reserved for an absent FFI capability")
+	}
+}
+
+func TestNodeGate_StaleAfterTeardown(t *testing.T) {
+	withLiveServer(t, &tsnet.Server{})
+	gate := liveGate(t)
+	bumpEpoch()
+	if gate.stillCurrent() {
+		t.Fatal("a gate from before the epoch bump must be stale")
+	}
+}
+
+// TestNodeGate_StaleAcrossTwoLifecycles is the hardening over the old boolean
+// "stopping" latch: a latch is cleared by the next Start, so an op stuck across
+// two lifecycles (gated under node N, N stops, N+1 starts) would pass the
+// cleared latch and commit N-era state into N+1's world. An epoch compare
+// refuses any later lifecycle, not just "currently stopping".
+func TestNodeGate_StaleAcrossTwoLifecycles(t *testing.T) {
+	withLiveServer(t, &tsnet.Server{})
+	gate := liveGate(t)
+
+	bumpEpoch()                        // node N stops
+	withLiveServer(t, &tsnet.Server{}) // node N+1 starts (no epoch change)
+	if fresh := liveGate(t); !fresh.stillCurrent() {
+		t.Fatal("a gate acquired under the new lifecycle must be current")
+	}
+	if gate.stillCurrent() {
+		t.Fatal("a gate from a previous lifecycle must stay stale after the next Start")
+	}
+}
+
+// TestCommitGates_RefuseStaleAcrossRegistries is the table-driven teardown-race
+// harness: every registry's commit point must refuse a stale gate and leave the
+// registry empty, and accept a live gate. New registries should add a row.
+func TestCommitGates_RefuseStaleAcrossRegistries(t *testing.T) {
+	withLiveServer(t, &tsnet.Server{})
+
+	cases := []struct {
+		name string
+		// register attempts the subsystem's real commit path with [gate];
+		// returns whether the registration was accepted.
+		register func(t *testing.T, gate nodeGate) bool
+		// count reports the registry's live entries.
+		count func() int
+		// sweep runs the subsystem's real nodeRuntime.close teardown sweep.
+		sweep func()
+	}{
+		{
+			name: "tcp-listener",
+			register: func(t *testing.T, gate nodeGate) bool {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("listen: %v", err)
+				}
+				reg, err := registerTcpFdListener(gate, ln, "127.0.0.1")
+				if err != nil {
+					return false // registerTcpFdListener closed ln
+				}
+				t.Cleanup(func() { TcpCloseFdListener(reg.ID) })
+				return true
+			},
+			count: func() int {
+				return currentTcpListeners().size()
+			},
+			sweep: func() {
+				for _, ln := range currentTcpListeners().drain() {
+					_ = ln.Close()
+				}
+			},
+		},
+		{
+			name: "udp-bridge",
+			register: func(t *testing.T, gate nodeGate) bool {
+				pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("listen packet: %v", err)
+				}
+				dartFd, goConn, err := newDatagramSocketPairConn()
+				if err != nil {
+					pc.Close()
+					t.Fatalf("socketpair conn: %v", err)
+				}
+				id := atomic.AddInt64(&udpBindingID, 1)
+				if err := runUdpFdBridge(gate, id, goConn, pc); err != nil {
+					// The bridge closed pc and goConn on refusal; the Dart-side
+					// fd is ours to close (mirrors UdpBindFd's refusal path).
+					_ = unix.Close(dartFd)
+					return false
+				}
+				t.Cleanup(func() {
+					UdpCloseBinding(id)
+					_ = unix.Close(dartFd)
+				})
+				return true
+			},
+			count: func() int {
+				return currentUdpBridges().size()
+			},
+			sweep: func() {
+				for _, bridge := range currentUdpBridges().drain() {
+					bridge.close()
+				}
+			},
+		},
+		{
+			name: "http-transport-slot",
+			register: func(t *testing.T, gate nodeGate) bool {
+				tr, oneOff := gate.runtime.tailnetTransport(newFakeTransport)
+				if tr == nil {
+					t.Fatal("tailnetTransport must always return a transport")
+				}
+				// Accepted iff MY runtime's slot now holds my transport; a
+				// one-off means the closed slot correctly refused it.
+				gate.runtime.httpMu.Lock()
+				accepted := gate.runtime.httpTransport == tr
+				gate.runtime.httpMu.Unlock()
+				if accepted && oneOff {
+					t.Fatal("an accepted registration must not be reported one-off")
+				}
+				return accepted
+			},
+			count: func() int {
+				runtime := currentRuntime()
+				if runtime == nil {
+					return 0
+				}
+				runtime.httpMu.Lock()
+				defer runtime.httpMu.Unlock()
+				if runtime.httpTransport != nil {
+					return 1
+				}
+				return 0
+			},
+			sweep: func() {
+				if runtime := currentRuntime(); runtime != nil {
+					runtime.closeTailnetTransport()
+				}
+			},
+		},
+		// No Funnel row: Funnel is an AllowFunnel bit on the runtime-owned
+		// ServeConfig authority, not a listener registry.
+		{
+			name: "http-binding",
+			register: func(t *testing.T, gate nodeGate) bool {
+				state := &httpBindingState{
+					requests: make(chan *HttpIncomingRequest, 1),
+					done:     make(chan struct{}),
+				}
+				return registerHttpBinding(gate, atomic.AddInt64(&httpBindingID, 1), state)
+			},
+			count: func() int {
+				return currentHttpBindings().size()
+			},
+			sweep: func() {
+				for _, state := range currentHttpBindings().drain() {
+					state.close()
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The preceding row simulated a teardown. Publish a fresh runtime
+			// generation for this row's live-path assertion.
+			runtimes.mu.Lock()
+			if previous := runtimes.current; previous != nil && previous.generation != nodeEpoch.Load() {
+				next := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), previous.config)
+				next.server = previous.server
+				runtimes.current = next
+			}
+			runtimes.mu.Unlock()
+
+			t.Cleanup(tc.sweep)
+			if base := tc.count(); base != 0 {
+				t.Fatalf("registry not empty at test start: %d", base)
+			}
+
+			// Live gate: commit accepted.
+			if ok := tc.register(t, liveGate(t)); !ok {
+				t.Fatal("a live gate must be accepted at the commit point")
+			}
+			if got := tc.count(); got != 1 {
+				t.Fatalf("live registration must land in the registry: count=%d", got)
+			}
+
+			// Teardown, in nodeRuntime.close's real order: an op is in flight (its
+			// gate acquired), the epoch bumps, this registry is swept.
+			gate := liveGate(t)
+			bumpEpoch()
+			tc.sweep()
+			if got := tc.count(); got != 0 {
+				t.Fatalf("the teardown sweep must drain the registry: count=%d", got)
+			}
+
+			// The in-flight op reaches its commit point late: refused, and the
+			// registry stays empty — nothing repopulates behind the sweep.
+			if ok := tc.register(t, gate); ok {
+				t.Fatal("a stale gate must be refused at the commit point")
+			}
+			if got := tc.count(); got != 0 {
+				t.Fatalf("a refused registration must not land behind the sweep: count=%d", got)
+			}
+		})
+	}
+}
+
+// TestCommitGates_RaceWithTeardown stresses register-vs-teardown under -race.
+// The invariant is checked IN the teardown loop, at the only moment it is
+// decidable: right after bump+sweep while srv is still nil, any cache entry is
+// a stale-gate commit that landed behind the sweep (no fresh gate can exist).
+// Two distinct lifecycles' servers alternate so pointer confusion would also
+// be observable.
+func TestCommitGates_RaceWithTeardown(t *testing.T) {
+	serverA := &tsnet.Server{}
+	serverB := &tsnet.Server{}
+	withLiveServer(t, serverA)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var leaks atomic.Int64
+
+	// Fresh-gate registrars: acquire a gate per commit, the well-behaved path.
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if gate, ok := acquireNodeGate(); ok {
+					_, _ = gate.runtime.tailnetTransport(newFakeTransport)
+				}
+			}
+		}()
+	}
+	// Gate-holder registrars: reuse one gate across a burst of commits, so
+	// every teardown strands them mid-burst with a stale gate — the actual
+	// adversary the epoch refuses. (Fresh-gate registrars alone are stale only
+	// in the instruction-scale window between acquire and commit, which a
+	// broken guard survives for the whole run.)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				gate, ok := acquireNodeGate()
+				if !ok {
+					continue
+				}
+				for j := 0; j < 512; j++ {
+					_, _ = gate.runtime.tailnetTransport(newFakeTransport)
+				}
+			}
+		}()
+	}
+
+	// Teardown/Start loop: bump, CHECK owners, sweep, CHECK empty, alternate
+	// the live server. Two discriminating assertions (an end-state check after
+	// all writers stop is vacuous — reset() trivially empties an uncontended
+	// cache):
+	//
+	//  1. Pre-sweep, the cache may only be owned by the lifecycle being
+	//     retired: a stale gate from an EARLIER lifecycle that committed during
+	//     this one leaves the other server as owner, observable for the whole
+	//     lifecycle, not just a race window.
+	//  2. Post-sweep, while srv is still nil, no registrar can acquire a fresh
+	//     gate, so ANY entry is a stale-gate commit that landed behind the
+	//     sweep — the exact race the epoch closes.
+	//
+	// With stillCurrent disabled the gate-holder registrars trip these within
+	// a few iterations; with it working, never.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		current := serverA
+		next := serverB
+		for i := 0; i < 400; i++ {
+			runtimes.mu.Lock()
+			nodeEpoch.Add(1)
+			retiring := runtimes.current
+			runtimes.current = nil
+			runtimes.mu.Unlock()
+			if retiring != nil {
+				// nodeRuntime.close's sweep: after this, any entry in the
+				// retiring slot is a stale commit that landed behind the
+				// sweep — the exact leak the closed bit makes impossible.
+				// (Cross-lifecycle pollution is structural now: a stale gate
+				// can only ever reach its own runtime's slot.)
+				retiring.closeTailnetTransport()
+				retiring.httpMu.Lock()
+				if retiring.httpTransport != nil {
+					leaks.Add(1) // landed behind the sweep
+				}
+				retiring.httpMu.Unlock()
+			}
+			runtimes.mu.Lock()
+			nextRuntime := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+			nextRuntime.server = next
+			runtimes.current = nextRuntime
+			runtimes.mu.Unlock()
+			current, next = next, current
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+	if got := leaks.Load(); got != 0 {
+		t.Fatalf("%d stale-gate commits landed behind a teardown sweep", got)
+	}
+
+	// Final teardown: after this, nothing may remain cached in the last
+	// lifecycle's slot.
+	runtimes.mu.Lock()
+	nodeEpoch.Add(1)
+	last := runtimes.current
+	runtimes.current = nil
+	runtimes.mu.Unlock()
+	if last != nil {
+		last.closeTailnetTransport()
+		last.httpMu.Lock()
+		leaked := last.httpTransport != nil
+		last.httpMu.Unlock()
+		if leaked {
+			t.Fatal("transport slot must be empty after the final sweep")
+		}
+	}
+}
+
+// TestDebugNodeState smoke-checks the census used by leak diagnostics.
+func TestDebugNodeState(t *testing.T) {
+	snap := debugNodeState()
+	if snap.Epoch != nodeEpoch.Load() {
+		t.Fatalf("census epoch %d != live epoch %d", snap.Epoch, nodeEpoch.Load())
+	}
+}
+
+// TestDebugNodeStateJSONContract pins the wire shape consumed by Dart's
+// Diag.nodeState(): flat object, these exact keys.
+func TestDebugNodeStateJSONContract(t *testing.T) {
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(DebugNodeState()), &decoded); err != nil {
+		t.Fatalf("DebugNodeState is not valid JSON: %v", err)
+	}
+	for _, key := range []string{
+		"epoch", "servePublications",
+		"httpBindings", "tcpListeners", "udpBridges", "transportCached",
+	} {
+		if _, ok := decoded[key]; !ok {
+			t.Errorf("DebugNodeState missing key %q", key)
+		}
+	}
+	if _, ok := decoded["funnelForwarders"]; ok {
+		t.Error("DebugNodeState must not expose the deleted Funnel registry")
+	}
+}

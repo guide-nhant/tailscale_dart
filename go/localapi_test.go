@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/opt"
 )
 
 func TestNodeIdentityFromWhoIsMapsFields(t *testing.T) {
@@ -131,6 +131,40 @@ func TestPingPathDirect(t *testing.T) {
 	}
 }
 
+func TestDiagPingRejectsSupersededRuntimeBeforeReplacementLocalAPI(t *testing.T) {
+	superseded := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+	replacement := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+	runtimes.mu.Lock()
+	previous := runtimes.current
+	if runtimes.candidate != nil || runtimes.draining != nil {
+		runtimes.mu.Unlock()
+		t.Fatal("test cannot publish a replacement during a lifecycle transition")
+	}
+	runtimes.current = replacement
+	runtimes.mu.Unlock()
+	t.Cleanup(func() {
+		runtimes.mu.Lock()
+		runtimes.current = previous
+		runtimes.mu.Unlock()
+		superseded.cancel()
+		replacement.cancel()
+	})
+
+	for _, token := range []uint64{0, superseded.token} {
+		out := DiagPing(token, "100.64.0.1", 0, "disco")
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+			t.Fatalf("DiagPing token %d returned invalid JSON %q: %v", token, out, err)
+		}
+		if parsed["code"] != "staleRuntime" {
+			t.Fatalf("DiagPing token %d result = %v, want staleRuntime", token, parsed)
+		}
+		if !strings.Contains(fmt.Sprint(parsed["error"]), "captured runtime") {
+			t.Fatalf("DiagPing token %d reached replacement LocalAPI: %v", token, parsed)
+		}
+	}
+}
+
 // fakeHTTPErr stands in for apitype.HTTPErr so we can exercise the
 // errors.As path in classifyLocalAPIError without pulling the real
 // upstream type (which moves between releases).
@@ -168,22 +202,109 @@ func TestClassifyLocalAPIError_HTTPStatusCodes(t *testing.T) {
 	}
 }
 
-func TestClassifyLocalAPIError_FeatureDisabledFromMessage(t *testing.T) {
-	cases := []string{
-		"Taildrop is disabled",
-		"funnel not enabled for this node",
-		"MagicDNS is disabled by operator",
-		"tsnet: you must enable HTTPS in the admin panel to proceed",
-		"Funnel not available; HTTPS must be enabled",
-		"node has no funnel attribute",
+func TestClassifyLocalAPIError_TypedFeatureUnavailable(t *testing.T) {
+	// The message deliberately contains no backstop phrasing, proving the
+	// classification comes from the typed sentinel, not prose.
+	err := fmt.Errorf("%w: capability xyz missing", errFeatureUnavailable)
+	code, status := classifyLocalAPIError(err)
+	if code != "featureDisabled" || status != 0 {
+		t.Fatalf("typed serve-feature error = (%q, %d), want (featureDisabled, 0)", code, status)
 	}
-	for _, msg := range cases {
+}
+
+// Classification is asserted through applyServeForward, not by handing
+// classifyLocalAPIError a synthetic error: wrapping happens at these call
+// sites, so only the real path proves the code a Dart caller actually sees.
+func TestApplyServeForwardFeatureErrorCodes(t *testing.T) {
+	t.Run("HTTPS capability off is typed featureDisabled", func(t *testing.T) {
+		st := serveTestStatus()
+		st.Self.CapMap = nil
+		_, err := applyServeForward(new(ipn.ServeConfig), st, serveForwardPayload{
+			TailnetPort:  443,
+			LocalAddress: "127.0.0.1",
+			LocalPort:    3000,
+			Path:         "/",
+			HTTPS:        true,
+		})
+		if !errors.Is(err, errFeatureUnavailable) {
+			t.Fatalf("HTTPS-capability failure must wrap the typed sentinel; got %v", err)
+		}
+		if code, _ := classifyLocalAPIError(err); code != "featureDisabled" {
+			t.Fatalf("HTTPS-capability failure code = %q, want featureDisabled", code)
+		}
+	})
+
+	// Upstream returns one untyped error for both funnel refusals. A
+	// disallowed port must stay forbidden: collapsing it into the typed
+	// featureDisabled sentinel would change the code callers branch on.
+	t.Run("disallowed funnel port stays forbidden", func(t *testing.T) {
+		st := serveTestStatus()
+		st.Self.CapMap = tailcfg.NodeCapMap{
+			tailcfg.CapabilityHTTPS: nil,
+			tailcfg.NodeAttrFunnel:  nil,
+		}
+		_, err := applyServeForward(new(ipn.ServeConfig), st, serveForwardPayload{
+			TailnetPort:  8080,
+			LocalAddress: "127.0.0.1",
+			LocalPort:    3000,
+			Path:         "/",
+			HTTPS:        true,
+			Funnel:       true,
+		})
+		if err == nil {
+			t.Fatal("port 8080 must be refused for Funnel")
+		}
+		if errors.Is(err, errFeatureUnavailable) {
+			t.Fatalf("funnel port policy must not be typed featureDisabled; got %v", err)
+		}
+		if code, _ := classifyLocalAPIError(err); code != "forbidden" {
+			t.Fatalf("funnel port-policy code = %q, want forbidden", code)
+		}
+	})
+}
+
+func TestClassifyLocalAPIError_FeatureDisabledFromMessage(t *testing.T) {
+	// Exact strings from tailscale.com's ipn/serve.go NodeCanFunnel and
+	// ipn/ipnlocal/serve.go. If upstream rewords these, this test fails — which
+	// is the point, since classification hinges on the text.
+	realUpstream := []string{
+		`Funnel not available; HTTPS must be enabled. See https://tailscale.com/s/https.`,
+		`Funnel not available; "funnel" node attribute not set. See https://tailscale.com/s/no-funnel.`,
+		"Unable to turn on Funnel while shields-up is enabled",
+	}
+	for _, msg := range realUpstream {
 		t.Run(msg, func(t *testing.T) {
-			code, _ := classifyLocalAPIError(errors.New(msg))
-			if code != "featureDisabled" {
-				t.Errorf("code = %q, want %q", code, "featureDisabled")
+			for _, err := range []error{errors.New(msg), notAppliedError(errors.New(msg))} {
+				code, _ := classifyLocalAPIError(err)
+				if code != "featureDisabled" {
+					t.Errorf("code = %q, want %q for %q", code, "featureDisabled", err)
+				}
 			}
 		})
+	}
+}
+
+func TestClassifyLocalAPIError_UnrelatedAvailabilityProseStaysUnknown(t *testing.T) {
+	for _, msg := range []string{
+		"network map not available",
+		"feature not enabled for this node",
+		"you must enable this in the admin panel",
+		"this capability is disabled by the operator",
+	} {
+		t.Run(msg, func(t *testing.T) {
+			if code, _ := classifyLocalAPIError(errors.New(msg)); code != "" {
+				t.Fatalf("unrelated error code = %q, want unknown", code)
+			}
+		})
+	}
+}
+
+func TestClassifyLocalAPIError_ForbiddenFromFunnelPortMessage(t *testing.T) {
+	// Real upstream string (ipn/serve.go CheckFunnelAccess): a disallowed
+	// funnel port maps to forbidden, not featureDisabled.
+	code, _ := classifyLocalAPIError(errors.New("port 8080 is not allowed for funnel; allowed ports are: [443 8443 10000]"))
+	if code != "forbidden" {
+		t.Errorf("code = %q, want %q", code, "forbidden")
 	}
 }
 
@@ -194,6 +315,23 @@ func TestClassifyLocalAPIError_UnknownError(t *testing.T) {
 	}
 	if status != 0 {
 		t.Errorf("status = %d, want 0 for non-HTTP error", status)
+	}
+}
+
+func TestRuntimeLocalClient_CancelsAndClassifiesStaleGeneration(t *testing.T) {
+	runtime := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+	access := &runtimeLocalClient{runtime: runtime}
+	ctx, cancel := access.callContext(0)
+	defer cancel()
+
+	runtime.cancel()
+	<-ctx.Done()
+	if err := access.resultError(errors.New("late LocalAPI result")); !errors.Is(err, ErrRuntimeStale) {
+		t.Fatalf("resultError = %v, want ErrRuntimeStale", err)
+	}
+	code, status := classifyLocalAPIError(ErrRuntimeStale)
+	if code != "staleRuntime" || status != 0 {
+		t.Fatalf("stale classification = (%q, %d), want (staleRuntime, 0)", code, status)
 	}
 }
 
@@ -252,17 +390,20 @@ func TestLocalAPIError_OmitsCodeWhenUnclassified(t *testing.T) {
 	}
 }
 
-func TestIsNotFound_StringFallback(t *testing.T) {
-	// Errors from older upstream versions that don't implement
-	// Status() still flag via the "404" substring fallback.
-	if !isNotFound(errors.New("whois returned 404")) {
-		t.Error("expected fallback string match for '404'")
+func TestIsNotFound_TypedOnly(t *testing.T) {
+	// The pinned upstream returns the exported sentinel from WhoIs; typed
+	// evidence is required and prose is deliberately not classified.
+	if !isNotFound(local.ErrPeerNotFound) {
+		t.Error("expected sentinel match for local.ErrPeerNotFound")
 	}
-	if !isNotFound(errors.New("peer not found")) {
-		t.Error("expected fallback string match for 'not found'")
+	if !isNotFound(fmt.Errorf("whois: %w", local.ErrPeerNotFound)) {
+		t.Error("expected wrapped sentinel match")
 	}
-	if isNotFound(errors.New("unrelated error")) {
-		t.Error("non-404 error should not match")
+	if isNotFound(errors.New("whois returned 404")) {
+		t.Error("bare '404' prose must not classify as not-found")
+	}
+	if isNotFound(errors.New("peer not found")) {
+		t.Error("bare 'not found' prose must not classify as not-found")
 	}
 }
 
@@ -278,10 +419,6 @@ func TestPrefsToJSONShape(t *testing.T) {
 		AdvertiseRoutes: []netip.Prefix{
 			netip.MustParsePrefix("10.0.0.0/24"),
 		},
-		AutoUpdate: ipn.AutoUpdatePrefs{
-			Check: true,
-			Apply: opt.NewBool(true),
-		},
 	}
 
 	var parsed map[string]any
@@ -291,8 +428,8 @@ func TestPrefsToJSONShape(t *testing.T) {
 	if got := parsed["acceptRoutes"]; got != true {
 		t.Errorf("acceptRoutes = %v, want true", got)
 	}
-	if got := parsed["autoUpdate"]; got != true {
-		t.Errorf("autoUpdate = %v, want true", got)
+	if _, ok := parsed["autoUpdate"]; ok {
+		t.Error("prefs snapshot exposed unsupported embedded-runtime autoUpdate")
 	}
 	if got := parsed["autoExitNode"]; got != true {
 		t.Errorf("autoExitNode = %v, want true", got)
@@ -305,8 +442,6 @@ func TestPrefsToJSONShape(t *testing.T) {
 func TestMaskedPrefsFromPayload(t *testing.T) {
 	acceptRoutes := true
 	shieldsUp := false
-	autoUpdate := true
-	hostname := " router "
 	exitNodeID := " n123 "
 	routes := []string{"10.0.0.7/24"}
 	tags := []string{"tag:server"}
@@ -316,8 +451,6 @@ func TestMaskedPrefsFromPayload(t *testing.T) {
 		AcceptRoutes:     &acceptRoutes,
 		ShieldsUp:        &shieldsUp,
 		AdvertisedTags:   &tags,
-		AutoUpdate:       &autoUpdate,
-		Hostname:         &hostname,
 		ExitNodeID:       &exitNodeID,
 	})
 	if err != nil {
@@ -336,14 +469,8 @@ func TestMaskedPrefsFromPayload(t *testing.T) {
 	if !masked.AdvertiseTagsSet || len(masked.AdvertiseTags) != 1 || masked.AdvertiseTags[0] != "tag:server" {
 		t.Fatalf("AdvertiseTags = %v, set=%v", masked.AdvertiseTags, masked.AdvertiseTagsSet)
 	}
-	if !masked.AutoUpdateSet.CheckSet || !masked.AutoUpdateSet.ApplySet || !masked.AutoUpdate.Check {
-		t.Fatalf("AutoUpdate = %+v, set=%+v", masked.AutoUpdate, masked.AutoUpdateSet)
-	}
-	if apply, ok := masked.AutoUpdate.Apply.Get(); !ok || !apply {
-		t.Fatalf("AutoUpdate.Apply = %v/%v, want true/true", apply, ok)
-	}
-	if !masked.HostnameSet || masked.Hostname != "router" {
-		t.Fatalf("Hostname = %q, set=%v", masked.Hostname, masked.HostnameSet)
+	if masked.WantRunningSet || masked.HostnameSet || masked.AutoUpdateSet.CheckSet || masked.AutoUpdateSet.ApplySet {
+		t.Fatalf("prefs update gained lifecycle authority: %+v", masked)
 	}
 	if !masked.ExitNodeIDSet || !masked.ExitNodeIPSet || !masked.AutoExitNodeSet || string(masked.ExitNodeID) != "n123" {
 		t.Fatalf("Exit node fields: id=%q idSet=%v ipSet=%v autoSet=%v", masked.ExitNodeID, masked.ExitNodeIDSet, masked.ExitNodeIPSet, masked.AutoExitNodeSet)
@@ -432,28 +559,14 @@ func TestApplyServeClearRemovesLastHandlerAndFunnel(t *testing.T) {
 	}
 	sc.SetFunnel("demo.tailnet.ts.net", 80, true)
 
-	if err := applyServeClear(sc, st, serveClearPayload{
+	if err := applyServeClearForHostWithFunnelCleanup(sc, "demo.tailnet.ts.net", serveClearPayload{
 		TailnetPort: 80,
 		Path:        "/",
-	}); err != nil {
-		t.Fatalf("applyServeClear: %v", err)
+	}, true); err != nil {
+		t.Fatalf("applyServeClearForHostWithFunnelCleanup: %v", err)
 	}
 	if sc.Web != nil || sc.TCP != nil || sc.AllowFunnel != nil {
 		t.Fatalf("serve config not fully cleared: %+v", sc)
-	}
-}
-
-func TestServePublicationRegistryTracksProcessOwnedMappings(t *testing.T) {
-	resetServePublicationRegistryForTest(t)
-
-	key := servePublicationKey{host: "demo.tailnet.ts.net", port: 443, path: "/"}
-	trackServePublication(key)
-	keys := takeServePublications()
-	if len(keys) != 1 || keys[0] != key {
-		t.Fatalf("keys = %+v, want [%+v]", keys, key)
-	}
-	if keys := takeServePublications(); len(keys) != 0 {
-		t.Fatalf("registry was not drained: %+v", keys)
 	}
 }
 
@@ -472,7 +585,7 @@ func TestRemoveServeWebHandlerPreservesOtherPaths(t *testing.T) {
 		}
 	}
 
-	removeServeWebHandler(sc, "demo.tailnet.ts.net", 443, "/api")
+	removeServeWebHandlerWithFunnelCleanup(sc, "demo.tailnet.ts.net", 443, "/api", true)
 	hp := ipn.HostPort("demo.tailnet.ts.net:443")
 	if sc.Web == nil || sc.Web[hp] == nil || sc.Web[hp].Handlers["/"] == nil {
 		t.Fatalf("root handler was removed: %+v", sc)
@@ -481,7 +594,7 @@ func TestRemoveServeWebHandlerPreservesOtherPaths(t *testing.T) {
 		t.Fatalf("/api handler still present: %+v", sc.Web[hp].Handlers)
 	}
 
-	removeServeWebHandler(sc, "demo.tailnet.ts.net", 443, "/")
+	removeServeWebHandlerWithFunnelCleanup(sc, "demo.tailnet.ts.net", 443, "/", true)
 	if sc.Web != nil || sc.TCP != nil {
 		t.Fatalf("serve config not fully cleared: %+v", sc)
 	}
@@ -500,15 +613,15 @@ func TestNormalizeServePathRejectsTraversalSegments(t *testing.T) {
 func TestValidateServeLocalAddressRequiresLoopback(t *testing.T) {
 	for _, address := range []string{"127.0.0.1", "127.12.34.56", "::1", "localhost", "LOCALHOST"} {
 		t.Run("allow "+address, func(t *testing.T) {
-			if err := validateServeLocalAddress(address); err != nil {
-				t.Fatalf("validateServeLocalAddress(%q): %v", address, err)
+			if _, err := normalizeServeLocalAddress(address); err != nil {
+				t.Fatalf("normalizeServeLocalAddress(%q): %v", address, err)
 			}
 		})
 	}
 	for _, address := range []string{"169.254.169.254", "192.168.1.1", "example.com", ""} {
 		t.Run("reject "+address, func(t *testing.T) {
-			if err := validateServeLocalAddress(address); err == nil {
-				t.Fatalf("validateServeLocalAddress(%q) succeeded, want error", address)
+			if _, err := normalizeServeLocalAddress(address); err == nil {
+				t.Fatalf("normalizeServeLocalAddress(%q) succeeded, want error", address)
 			}
 		})
 	}
@@ -539,30 +652,22 @@ func serveTestStatus() *ipnstate.Status {
 	}
 }
 
-func resetServePublicationRegistryForTest(t *testing.T) {
-	t.Helper()
-	servePublicationMu.Lock()
-	servePublications = map[servePublicationKey]struct{}{}
-	servePublicationMu.Unlock()
-	t.Cleanup(func() {
-		servePublicationMu.Lock()
-		servePublications = map[servePublicationKey]struct{}{}
-		servePublicationMu.Unlock()
-	})
-}
-
 // Compile-time sanity check that the error class string constants we
 // emit match the Dart-side parser in lib/src/worker/entrypoint.dart.
 // If someone renames one, this test fails loudly.
 func TestClassifyLocalAPIError_KnownCodesAreStable(t *testing.T) {
 	wantedCodes := []string{
-		"notFound", "forbidden", "conflict",
-		"preconditionFailed", "featureDisabled",
+		"staleRuntime", "notFound", "forbidden", "conflict",
+		"preconditionFailed", "featureDisabled", "serveConfigConflict",
+		"dataPlaneNotReady", "publicationBootstrapFailure",
+		"publicationNotApplied", "publicationCommitIndeterminate",
 	}
 	for _, want := range wantedCodes {
 		// Synthesize an error that should classify as `want`.
 		var err error
 		switch want {
+		case "staleRuntime":
+			err = ErrRuntimeStale
 		case "notFound":
 			err = fakeHTTPErr{status: http.StatusNotFound, msg: "x"}
 		case "forbidden":
@@ -572,7 +677,17 @@ func TestClassifyLocalAPIError_KnownCodesAreStable(t *testing.T) {
 		case "preconditionFailed":
 			err = fakeHTTPErr{status: http.StatusPreconditionFailed, msg: "x"}
 		case "featureDisabled":
-			err = errors.New("feature is disabled")
+			err = errFeatureUnavailable
+		case "serveConfigConflict":
+			err = ErrServeConfigConflict
+		case "dataPlaneNotReady":
+			err = ErrDataPlaneNotReady
+		case "publicationBootstrapFailure":
+			err = ErrPublicationBootstrapFailure
+		case "publicationNotApplied":
+			err = notAppliedError(errors.New("request canceled before dispatch"))
+		case "publicationCommitIndeterminate":
+			err = ErrPublicationCommitIndeterminate
 		}
 		code, _ := classifyLocalAPIError(err)
 		if code != want {
@@ -581,8 +696,103 @@ func TestClassifyLocalAPIError_KnownCodesAreStable(t *testing.T) {
 	}
 	// Also make sure we didn't drop a code.
 	for _, code := range wantedCodes {
-		if !strings.Contains("notFound,forbidden,conflict,preconditionFailed,featureDisabled", code) {
+		if !strings.Contains("staleRuntime,notFound,forbidden,conflict,preconditionFailed,featureDisabled,serveConfigConflict,dataPlaneNotReady,publicationBootstrapFailure,publicationNotApplied,publicationCommitIndeterminate", code) {
 			t.Errorf("untracked code %q", code)
 		}
+	}
+}
+
+func TestFailPublicationDeliveryKeepsOriginalDartErrorAsSynchronousOwner(t *testing.T) {
+	runtime := newNodeRuntime(nodeEpoch.Load(), nextDirectRuntimeToken(), runtimeConfig{})
+	runtimes.mu.Lock()
+	previous := runtimes.current
+	if runtimes.candidate != nil || runtimes.draining != nil {
+		runtimes.mu.Unlock()
+		t.Fatal("test cannot publish a runtime during a lifecycle transition")
+	}
+	runtimes.current = runtime
+	runtimes.mu.Unlock()
+	t.Cleanup(func() {
+		runtimes.mu.Lock()
+		runtimes.current = previous
+		runtimes.mu.Unlock()
+		runtime.cancel()
+		runtime.finishPreparation()
+	})
+
+	calls := 0
+	err := failPublicationDelivery(
+		runtime.token,
+		func(gotRuntime *nodeRuntime, cause error, reportRuntimeError bool) error {
+			calls++
+			if gotRuntime != runtime {
+				t.Fatalf("quarantined runtime = %p, want %p", gotRuntime, runtime)
+			}
+			if !errors.Is(cause, ErrPublicationCommitIndeterminate) {
+				t.Fatalf("quarantine cause = %v, want ErrPublicationCommitIndeterminate", cause)
+			}
+			if reportRuntimeError {
+				t.Fatal("explicit compensation must not emit a duplicate async runtime error")
+			}
+			return cause
+		},
+	)
+	if err != nil {
+		t.Fatalf("failPublicationDelivery: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("quarantine calls = %d, want 1", calls)
+	}
+}
+
+// TestIsTransientNoSuggestion pins the exit-node suggest() fix: the transient
+// "node not ready yet" errors (which cross the LocalAPI boundary as message
+// text) are recognized so ExitNodeSuggest maps them to a null suggestion
+// instead of throwing, while genuine errors still propagate.
+func TestIsTransientNoSuggestion(t *testing.T) {
+	transient := []string{
+		"no preferred DERP, try again later",
+		"no network map, try again later",
+		`Post "http://local-tailscaled.invalid/localapi/v0/suggest-exit-node": no preferred DERP, try again later`,
+	}
+	for _, m := range transient {
+		if !isTransientNoSuggestion(errors.New(m)) {
+			t.Errorf("isTransientNoSuggestion(%q) = false, want true", m)
+		}
+	}
+	notTransient := []string{"access denied", "404 not found", "internal error"}
+	for _, m := range notTransient {
+		if isTransientNoSuggestion(errors.New(m)) {
+			t.Errorf("isTransientNoSuggestion(%q) = true, want false", m)
+		}
+	}
+}
+
+// TestExitNodeSuggestResult pins the suggest() integration (not just the
+// matcher): a transient "not ready" error maps to an empty (null) suggestion,
+// a real error propagates, and a real suggestion returns its node id.
+func TestExitNodeSuggestResult(t *testing.T) {
+	transient := exitNodeSuggestResult(
+		apitype.ExitNodeSuggestionResponse{},
+		errors.New(`Post "http://x/localapi": no preferred DERP, try again later`),
+	)
+	if transient != `{"nodeId":""}` {
+		t.Errorf("transient error: got %q, want empty-nodeId JSON", transient)
+	}
+
+	realErr := exitNodeSuggestResult(
+		apitype.ExitNodeSuggestionResponse{},
+		errors.New("access denied"),
+	)
+	if realErr == `{"nodeId":""}` || !strings.Contains(realErr, "access denied") {
+		t.Errorf("real error: got %q, want a propagated error JSON", realErr)
+	}
+
+	ok := exitNodeSuggestResult(
+		apitype.ExitNodeSuggestionResponse{ID: "nABC123"},
+		nil,
+	)
+	if !strings.Contains(ok, "nABC123") {
+		t.Errorf("success: got %q, want nodeId nABC123", ok)
 	}
 }

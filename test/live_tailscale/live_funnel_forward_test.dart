@@ -23,8 +23,8 @@ import 'package:http/http.dart' as http;
 import 'package:tailscale/tailscale.dart';
 import 'package:test/test.dart';
 
-import '../e2e/support/native_asset_workaround.dart';
 import '../e2e/support/state_waiters.dart';
+import '../integration/support/process_state_root.dart';
 import 'support/tailscale_api.dart';
 
 void main() {
@@ -68,7 +68,7 @@ void main() {
     }
     try {
       final dir = stateDir;
-      if (dir != null) Directory(dir).deleteSync(recursive: true);
+      if (dir != null) clearProcessIntegrationState(Directory(dir));
     } catch (_) {}
     api?.close();
   });
@@ -76,15 +76,13 @@ void main() {
   test(
     'funnel.forward proxies public HTTPS traffic to a loopback HTTP server',
     () async {
-      await warmUpNativeAssetForPeerSubprocesses();
-
       api = LiveTailscaleApi(apiKey: apiKey, tailnetId: tailnetId);
-      stateDir = Directory.systemTemp
-          .createTempSync('tailscale_live_funnel_')
-          .path;
+      final processStateRoot = processIntegrationStateRoot();
+      clearProcessIntegrationState(processStateRoot);
+      stateDir = processStateRoot.path;
       final authKey = await api!.createAuthKey();
 
-      Tailscale.init(stateDir: stateDir!);
+      Tailscale.init(stateDir: stateDir!, appId: processIntegrationAppId);
       tsnet = Tailscale.instance;
       await recordUntil(
         tsnet!,

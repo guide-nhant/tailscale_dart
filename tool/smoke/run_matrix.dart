@@ -105,9 +105,8 @@ final class _SmokeMatrixRunner {
       if (config.strict && skipped.isNotEmpty) return false;
       return failed.isEmpty;
     } finally {
-      // Cleanup tasks are independent: parallelize the foreground ones and
-      // detach `compose down -v` so the runner exits as soon as the summary
-      // is reported. Detached docker continues teardown in the background.
+      // Detach `compose down -v` so the runner exits as soon as the summary is
+      // reported. Detached docker continues teardown in the background.
       if (headscaleStarted && !config.keepHeadscale) {
         _log('detaching docker compose down -v in background');
         try {
@@ -121,8 +120,11 @@ final class _SmokeMatrixRunner {
           stderr.writeln('failed to detach docker compose down -v: $error');
         }
       }
+      // The peer owns a runtime rooted below stateRoot. Stop it before deleting
+      // that directory so native teardown can validate and release its state
+      // lease instead of racing a recursive delete.
+      if (peer != null) await peer.stop();
       await Future.wait(<Future<void>>[
-        if (peer != null) peer.stop(),
         Future(() {
           try {
             stateRoot.deleteSync(recursive: true);
@@ -551,6 +553,16 @@ final class _SmokeMatrixRunner {
       }
     }
     final runnerUrl = _runnerUrlFor(target);
+    if (target == 'android') {
+      // Start the SIGSYS receipt from a clean buffer so the post-run scan can
+      // only see this run's crashes.
+      await _run(config.adb, [
+        '-s',
+        deviceId,
+        'logcat',
+        '-c',
+      ], allowFailure: true);
+    }
     _log('running $target smoke on Flutter device $deviceId');
     final runMode = target == 'android' ? config.androidRunMode : 'debug';
     final process = await Process.start(config.flutter, [
@@ -640,7 +652,11 @@ final class _SmokeMatrixRunner {
     );
 
     try {
-      return await result.future.timeout(config.timeout);
+      var run = await result.future.timeout(config.timeout);
+      if (target == 'android') {
+        run = await _applyAndroidSigsysCheck(run, deviceId);
+      }
+      return run;
     } on TimeoutException {
       return _TargetRun(
         target: target,
@@ -796,6 +812,54 @@ final class _SmokeMatrixRunner {
     }
   }
 
+  /// The Android runtime-receipt scan: the smoke (including its restart
+  /// cycle) must finish without the app-process seccomp policy killing a
+  /// thread. Zygote-spawned app processes carry the real policy — a binary
+  /// run from adb shell would not — so probe success plus a clean crash scan
+  /// here IS the Server.Start/reconnect/stop receipt. The full dump is saved
+  /// beside the system temp directory as the receipt artifact.
+  Future<_TargetRun> _applyAndroidSigsysCheck(
+    _TargetRun run,
+    String deviceId,
+  ) async {
+    try {
+      final dump = await _run(config.adb, [
+        '-s',
+        deviceId,
+        'logcat',
+        '-d',
+      ], allowFailure: true);
+      final text = dump.stdout as String? ?? '';
+      final artifact = File(
+        '${Directory.systemTemp.path}/dune_smoke_android_logcat_$_runStartMillis.txt',
+      );
+      artifact.writeAsStringSync(text);
+      _log('android logcat receipt saved to ${artifact.path}');
+      // Match crash-specific signatures only; benign boot chatter can mention
+      // seccomp policy installation without any violation.
+      final violations = text
+          .split('\n')
+          .where(
+            (line) => line.contains('SIGSYS') || line.contains('SYS_SECCOMP'),
+          )
+          .toList(growable: false);
+      if (violations.isNotEmpty) {
+        _log('android SIGSYS lines:\n${violations.join('\n')}');
+        return _TargetRun(
+          target: run.target,
+          ok: false,
+          skipped: false,
+          message:
+              'seccomp SIGSYS in logcat (${violations.length} lines; '
+              'see ${artifact.path})',
+        );
+      }
+    } catch (error) {
+      _log('android logcat scan failed (receipt not collected): $error');
+    }
+    return run;
+  }
+
   String _androidEmulatorExecutable() {
     final explicit = config.emulator;
     if (explicit != null && explicit.isNotEmpty) return explicit;
@@ -887,7 +951,6 @@ final class _ManagedPeer {
   }) async {
     final process = await Process.start(dart, [
       'run',
-      '--enable-experiment=native-assets',
       'bin/demo_node.dart',
       'serve',
       '--state-dir',
@@ -948,6 +1011,9 @@ final class _ManagedPeer {
       await process.exitCode.timeout(const Duration(seconds: 10));
     } on TimeoutException {
       process.kill(ProcessSignal.sigkill);
+      // Do not return until the OS has reaped the process. The caller deletes
+      // the peer's state directory immediately after this method completes.
+      await process.exitCode.timeout(const Duration(seconds: 10));
     }
     await stdoutSub.cancel();
     await stderrSub.cancel();

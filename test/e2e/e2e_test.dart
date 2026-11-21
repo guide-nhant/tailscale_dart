@@ -19,9 +19,10 @@ import 'package:path/path.dart' as p;
 import 'package:tailscale/tailscale.dart';
 import 'package:test/test.dart';
 
-import 'support/native_asset_workaround.dart';
 import 'support/peer_process.dart';
 import 'support/state_waiters.dart';
+import 'support/test_keybay_backend.dart';
+import '../support/persistent_state_inventory.dart';
 
 void main() {
   final controlUrl = Platform.environment['HEADSCALE_URL'];
@@ -41,17 +42,21 @@ void main() {
   late String stateDir;
 
   setUpAll(() async {
-    await warmUpNativeAssetForPeerSubprocesses();
-
     stateDir = Directory.systemTemp.createTempSync('tailscale_e2e_').path;
-    Tailscale.init(stateDir: stateDir);
+    installE2ETestKeybay(stateDir);
+    Tailscale.init(
+      stateDir: stateDir,
+      appId: 'dev.tailscale.dart.test.e2e.primary',
+    );
     tsnet = Tailscale.instance;
-    await detachLoadedNativeAssetForPeerSubprocesses();
   });
 
   tearDownAll(() async {
     try {
       await tsnet.down();
+    } catch (_) {}
+    try {
+      await tsnet.forgetLocalIdentity();
     } catch (_) {}
     try {
       Directory(stateDir).deleteSync(recursive: true);
@@ -124,12 +129,6 @@ void main() {
   });
 
   // Two-node groups spawn `dart run test/e2e/peer_main.dart` as a subprocess.
-  // On Linux CI runners the Dart hooks framework re-invokes the package's
-  // native build hook from the subprocess, which races the parent process's
-  // mmap of the .so and crashes the parent with SIGBUS. The library itself
-  // works fine on Linux — the issue is in the test harness's subprocess
-  // pattern. Currently un-skipped while diagnosing; the CI workflow dumps
-  // /tmp/dune_hook.log on failure (DUNE_HOOK_LOG=1 is set in env).
   group('two-node connectivity', () {
     late PeerProcess peer;
     late String peerStateDir;
@@ -142,12 +141,18 @@ void main() {
           .path;
       peer = await PeerProcess.spawn(
         stateDir: peerStateDir,
+        appId: 'dev.tailscale.dart.test.e2e.peer',
         controlUrl: controlUrl,
         authKey: authKey,
         ephemeral: true,
         hostname: 'dune-e2e-peer',
         responseBody: peerResponseBody,
       );
+      // Establish the WireGuard/DERP data path once, up front, so the timed
+      // data-plane tests below (including inbound peer→self requests) don't
+      // race path establishment inside their own timeouts — the primary source
+      // of this suite's CI flakiness.
+      await awaitDataPath(tsnet, peer.ipv4);
     });
 
     tearDownAll(() async {
@@ -442,7 +447,7 @@ void main() {
       }
 
       final first = await tsnet.onNodeChanges.first.timeout(
-        const Duration(seconds: 2),
+        const Duration(seconds: 5),
       );
       expect(first, isNotEmpty);
       expect(first.any((p) => p.ipv4 == peer.ipv4), isTrue);
@@ -512,6 +517,14 @@ void main() {
     );
   });
 
+  test('persistent runtime subtree has an explicit secure inventory', () {
+    final inventory = auditPersistentRuntimeInventory(stateDir);
+    // Machine-readable and content-free: safe to retain as the Linux
+    // Headscale receipt without exposing the envelope or log contents.
+    // ignore: avoid_print
+    print('R6_STATE_INVENTORY ${jsonEncode(inventory)}');
+  });
+
   group('peer reconnects with persisted credentials', () {
     late String persistStateDir;
     String? firstIpv4;
@@ -531,6 +544,7 @@ void main() {
     test('first launch registers and persists credentials', () async {
       final peer = await PeerProcess.spawn(
         stateDir: persistStateDir,
+        appId: 'dev.tailscale.dart.test.e2e.persist',
         controlUrl: controlUrl,
         authKey: persistAuthKey,
         hostname: 'dune-e2e-persist',
@@ -547,6 +561,7 @@ void main() {
     test('second launch reconnects without an authKey', () async {
       final peer = await PeerProcess.spawn(
         stateDir: persistStateDir,
+        appId: 'dev.tailscale.dart.test.e2e.persist',
         controlUrl: controlUrl,
         // Deliberately no authKey — must come up from persisted state.
         hostname: 'dune-e2e-persist',
@@ -579,13 +594,12 @@ void main() {
   //     synthetic publish, so the sequence is fully deterministic and
   //     asserted with `equals` (exact match).
   //
-  // [setUp] normalizes every test to enter with the engine `stopped`,
-  // credentials on disk, and no in-flight stream events. Test bodies then
-  // read linearly — arrange, act, assert — with no defensive preambles.
+  // [setUp] normalizes every test to enter with the engine `stopped` and no
+  // in-flight stream events. The retained container may hold either an
+  // enrolled or logged-out upstream profile after the logout cases below.
   //
-  // Placed at the end of the file because the logout tests wipe persisted
-  // state; setUp re-establishes them for the next test, but earlier
-  // groups outside this one can't rely on that repair.
+  // Placed at the end of the file because the logout tests mutate the
+  // persisted upstream profile; earlier groups require an enrolled profile.
   group('onStateChange lifecycle', () {
     const hostname = 'dune-e2e-lifecycle';
     Future<void> bringUp() => tsnet.up(
@@ -602,7 +616,7 @@ void main() {
       // into the test's subscription.
       switch ((await tsnet.status()).state) {
         case NodeState.noState:
-          // Logout wiped creds. Re-establish and shut down.
+          // A truly clean root needs an enrolled profile for reconnect tests.
           await recordUntil(tsnet, NodeState.running, bringUp);
           await recordUntil(tsnet, NodeState.stopped, tsnet.down);
         case NodeState.running:
@@ -612,6 +626,22 @@ void main() {
         case final unexpected:
           fail('unexpected entry state for lifecycle setUp: $unexpected');
       }
+    });
+
+    test('bind issued during a pending up() joins that runtime', () async {
+      late final TailscaleListener listener;
+      await recordUntil(tsnet, NodeState.running, () async {
+        final starting = bringUp();
+        listener = await tsnet.tcp.bind(port: 0);
+        await starting;
+      });
+      addTearDown(listener.close);
+
+      expect(
+        listener.local.port,
+        greaterThan(0),
+        reason: 'the bind must resolve against the runtime up() produced',
+      );
     });
 
     test('up with auth key emits Starting → Running', () async {
@@ -689,14 +719,22 @@ void main() {
         ]);
 
         await reconnect();
-        await bothSawRunning.timeout(const Duration(seconds: 10));
+        await bothSawRunning.timeout(const Duration(seconds: 45));
       },
     );
 
     test(
-      'logout from running emits [Stopped, NoState] and clears creds',
+      'lost confirmed logout response preserves storage and emits receipt',
       () async {
         await recordUntil(tsnet, NodeState.running, bringUp);
+
+        // Exercise the combined case: a real authenticated Store is present,
+        // upstream confirms logout, and the worker dies before Dart receives
+        // the response. Supervisor recovery must replay the retained receipt
+        // without converting logical logout into physical state deletion.
+        await tsnet.debugTerminateWorkerForTesting(
+          at: DebugTerminatePoint.afterNextLifecycleNativeResult,
+        );
 
         final sequence = await recordUntil(
           tsnet,
@@ -710,14 +748,24 @@ void main() {
           reason:
               'logout from running must emit Stopped then NoState — '
               'Stop() publishes Stopped on teardown, Logout() publishes '
-              'NoState after wiping creds. Subscribers rely on this full '
+              'NoState after upstream confirms profile removal. Subscribers rely on this full '
               'sequence to route back to the unauthenticated UI.',
         );
-        expect((await tsnet.status()).state, NodeState.noState);
+        expect(
+          (await tsnet.status()).state,
+          NodeState.stopped,
+          reason:
+              'until R4 can authenticate and inspect the encrypted map, the '
+              'idle filesystem probe must conservatively classify a retained '
+              'StateStore container as stopped; NoState above is the confirmed '
+              'logout event receipt',
+        );
         expect(
           Directory(p.join(stateDir, 'tailscale')).existsSync(),
-          isFalse,
-          reason: 'logout() should remove the persisted tailscale state subdir',
+          isTrue,
+          reason:
+              'logout() must preserve the lower-level StateStore container; '
+              'explicit local forget/reset owns physical deletion',
         );
       },
     );
@@ -736,7 +784,14 @@ void main() {
             "logout from stopped must not emit Stopped — Stop()'s "
             'wasRunning guard skips the publish when srv is nil',
       );
-      expect((await tsnet.status()).state, NodeState.noState);
+      expect(
+        (await tsnet.status()).state,
+        NodeState.stopped,
+        reason:
+            'the confirmed NoState logout receipt does not imply physical '
+            'StateStore absence; R4 will replace this conservative probe '
+            'with authenticated logical-state classification',
+      );
     });
 
     // Consecutive-duplicate scenarios — the stream filters these in
@@ -788,10 +843,10 @@ void main() {
       // fresh stream).
       await recordUntil(tsnet, NodeState.noState, tsnet.logout);
 
-      // Second logout — srv already nil (wasRunning guard skips Stop's
-      // Stopped publish), state dir already gone, but Logout still
-      // calls publishState("NoState"). onStateChange filters the duplicate
-      // because _previous is NoState from the first logout.
+      // Second logout — srv already nil, so Go briefly reopens the retained
+      // StateStore and upstream reports that it is already logged out. The
+      // temporary close remains hidden and onStateChange filters the duplicate
+      // NoState because _previous is NoState from the first logout.
       await tsnet.logout();
       await Future<void>.delayed(const Duration(seconds: 1));
       await sub.cancel();

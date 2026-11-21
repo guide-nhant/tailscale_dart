@@ -5,28 +5,24 @@ library;
 import 'dart:io';
 
 import 'package:test/test.dart';
-import 'package:tailscale/src/ffi_bindings.dart' as native;
 import 'package:tailscale/tailscale.dart';
+
+import '../support/process_state_root.dart';
 
 void main() {
   late Directory configuredStateBaseDir;
 
   setUpAll(() {
-    native.duneSetLogLevel(0);
-    configuredStateBaseDir = Directory.systemTemp.createTempSync(
-      'tailscale_serve_funnel_',
+    configuredStateBaseDir = processIntegrationStateRoot();
+    clearProcessIntegrationState(configuredStateBaseDir);
+    Tailscale.init(
+      stateDir: configuredStateBaseDir.path,
+      appId: processIntegrationAppId,
     );
-    Tailscale.init(stateDir: configuredStateBaseDir.path);
   });
 
   tearDownAll(() async {
-    try {
-      await Tailscale.instance.down();
-    } catch (_) {}
-    native.duneStop();
-    if (configuredStateBaseDir.existsSync()) {
-      configuredStateBaseDir.deleteSync(recursive: true);
-    }
+    await forgetProcessIntegrationState(configuredStateBaseDir);
   });
 
   group('before up()', () {

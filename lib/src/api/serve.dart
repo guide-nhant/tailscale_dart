@@ -1,28 +1,39 @@
-import 'dart:io' show InternetAddress, Platform;
+import 'dart:io' show Platform;
 
 import 'package:meta/meta.dart';
 
 import '../errors.dart';
+import 'serve_validation.dart';
+
+typedef ServeForwardResult = ({
+  Uri url,
+  int port,
+  String localAddress,
+  int localPort,
+  String path,
+  bool https,
+  bool funnel,
+  int generation,
+  int mappingToken,
+});
 
 typedef ServeForwardFn =
-    Future<
-      ({
-        Uri url,
-        int port,
-        String localAddress,
-        int localPort,
-        String path,
-        bool https,
-        bool funnel,
-      })
-    >
-    Function({
+    Future<ServeForwardResult> Function({
       required int tailnetPort,
       required int localPort,
       required String localAddress,
       required String path,
       required bool https,
       required bool funnel,
+    });
+
+typedef ServeCloseFn =
+    Future<void> Function({
+      required int tailnetPort,
+      required String path,
+      required bool funnel,
+      required int generation,
+      required int mappingToken,
     });
 
 typedef ServeClearFn =
@@ -52,7 +63,13 @@ final class TailscalePublishedService {
     required this.https,
     required this.funnel,
     required Future<void> Function() closeFn,
-  }) : _closeFn = closeFn;
+  }) : _closeFn = closeFn {
+    _publishedServiceFinalizer.attach(
+      this,
+      _PublishedServiceFinalizerToken(closeFn),
+      detach: this,
+    );
+  }
 
   /// URL where clients can reach the publication.
   ///
@@ -87,10 +104,32 @@ final class TailscalePublishedService {
 
   /// Removes this publication from the embedded node.
   ///
-  /// Idempotent for a given handle. If another caller has replaced the same
-  /// path/port before this is called, the current mapping at that path is
-  /// removed.
-  Future<void> close() => _closeFuture ??= _closeFn();
+  /// Idempotent for a given handle. This closes only the exact mapping created
+  /// for this handle. Replaced mappings and mappings from a newer runtime are
+  /// left untouched.
+  Future<void> close() {
+    final existing = _closeFuture;
+    if (existing != null) return existing;
+    late final Future<void> attempt;
+    attempt = Future<void>.sync(_closeFn).then<void>(
+      (_) {
+        if (identical(_closeFuture, attempt)) {
+          _publishedServiceFinalizer.detach(this);
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        // Native retains exact ownership on a confirmed-not-applied failure.
+        // Keep the GC fallback attached and let a later explicit close retry.
+        // The identity check also closes the synchronous-throw assignment race.
+        if (identical(_closeFuture, attempt)) {
+          _closeFuture = null;
+        }
+        Error.throwWithStackTrace(error, stackTrace);
+      },
+    );
+    _closeFuture = attempt;
+    return attempt;
+  }
 
   @override
   String toString() =>
@@ -117,12 +156,22 @@ final class TailscalePublishedService {
 /// Tailscale forwards identity headers such as `Tailscale-User-Login`,
 /// `Tailscale-User-Name`, and `Tailscale-User-Profile-Pic` to the loopback
 /// backend. Public Funnel requests do not include those headers.
+///
+/// Funnel visibility is host:port-scoped upstream. Do not place a supposedly
+/// private Serve path on a port that another mapping exposes through Funnel;
+/// use a separate port or authenticate every handler on the shared port.
+///
+/// Mobile HTTPS publication is not currently a qualified support surface. Do
+/// not infer iOS/Android support from desktop behavior; it remains gated on
+/// real-device HTTPS and persistent-sidecar inventory receipts.
 abstract class Serve {
   /// Publishes `http://[localAddress]:[localPort]` inside the tailnet.
   ///
   /// [tailnetPort] is the port on this node's MagicDNS name. [https] defaults
   /// to true, so the tailnet URL is `https://<node>...` and Tailscale
   /// terminates TLS before forwarding plaintext HTTP to the local service.
+  /// On iOS and Android this HTTPS mode is currently unqualified and should not
+  /// be presented as supported until the package's mobile receipt is published.
   ///
   /// [localAddress] must be loopback (`127.0.0.1`, `::1`, or `localhost`).
   /// This prevents accidentally publishing arbitrary LAN or metadata-service
@@ -146,15 +195,21 @@ abstract class Serve {
 Serve createServe({
   required ServeForwardFn forwardFn,
   required ServeClearFn clearFn,
-}) => _Serve(forwardFn: forwardFn, clearFn: clearFn);
+  required ServeCloseFn closeFn,
+}) => _Serve(forwardFn: forwardFn, clearFn: clearFn, closeFn: closeFn);
 
 final class _Serve implements Serve {
-  _Serve({required ServeForwardFn forwardFn, required ServeClearFn clearFn})
-    : _forward = forwardFn,
-      _clear = clearFn;
+  _Serve({
+    required ServeForwardFn forwardFn,
+    required ServeClearFn clearFn,
+    required ServeCloseFn closeFn,
+  }) : _forward = forwardFn,
+       _clear = clearFn,
+       _close = closeFn;
 
   final ServeForwardFn _forward;
   final ServeClearFn _clear;
+  final ServeCloseFn _close;
 
   @override
   Future<TailscalePublishedService> forward({
@@ -167,10 +222,10 @@ final class _Serve implements Serve {
     if (Platform.isWindows) {
       throw const TailscaleServeException('Windows is not supported.');
     }
-    final normalizedPath = _normalizePath(path);
-    final normalizedAddress = _normalizeLocalAddress(localAddress);
-    _validatePort(tailnetPort, 'tailnetPort');
-    _validatePort(localPort, 'localPort');
+    final normalizedPath = normalizeServePath(path);
+    final normalizedAddress = normalizeServeLocalAddress(localAddress);
+    validateServePort(tailnetPort, 'tailnetPort');
+    validateServePort(localPort, 'localPort');
 
     try {
       final published = await _forward(
@@ -181,10 +236,7 @@ final class _Serve implements Serve {
         https: https,
         funnel: false,
       );
-      return _publicationFrom(
-        published,
-        closeFn: () => clear(tailnetPort: published.port, path: published.path),
-      );
+      return _publicationFrom(published, closeFn: _close);
     } catch (e) {
       if (e is TailscaleException) rethrow;
       throw TailscaleServeException(
@@ -199,8 +251,8 @@ final class _Serve implements Serve {
     if (Platform.isWindows) {
       throw const TailscaleServeException('Windows is not supported.');
     }
-    final normalizedPath = _normalizePath(path);
-    _validatePort(tailnetPort, 'tailnetPort');
+    final normalizedPath = normalizeServePath(path);
+    validateServePort(tailnetPort, 'tailnetPort');
     try {
       await _clear(
         tailnetPort: tailnetPort,
@@ -219,102 +271,59 @@ final class _Serve implements Serve {
 
 @internal
 TailscalePublishedService createPublishedServiceForFunnel({
-  required ({
-    Uri url,
-    int port,
-    String localAddress,
-    int localPort,
-    String path,
-    bool https,
-    bool funnel,
-  })
-  published,
-  required Future<void> Function() closeFn,
+  required ServeForwardResult published,
+  required ServeCloseFn closeFn,
 }) => _publicationFrom(published, closeFn: closeFn);
 
 TailscalePublishedService _publicationFrom(
-  ({
-    Uri url,
-    int port,
-    String localAddress,
-    int localPort,
-    String path,
-    bool https,
-    bool funnel,
-  })
-  published, {
-  required Future<void> Function() closeFn,
-}) => TailscalePublishedService._(
-  url: published.url,
-  port: published.port,
-  localAddress: published.localAddress,
-  localPort: published.localPort,
-  path: published.path,
-  https: published.https,
-  funnel: published.funnel,
-  closeFn: closeFn,
-);
-
-int _validatePort(int port, String name) {
-  if (port < 1 || port > 65535) {
-    throw RangeError.range(port, 1, 65535, name);
-  }
-  return port;
-}
-
-String _normalizeLocalAddress(String localAddress) {
-  final trimmed = localAddress.trim();
-  if (trimmed.isEmpty) {
-    throw ArgumentError.value(
-      localAddress,
-      'localAddress',
-      'must not be empty',
+  ServeForwardResult published, {
+  required ServeCloseFn closeFn,
+}) {
+  if (published.generation <= 0 || published.mappingToken <= 0) {
+    const message =
+        'Native runtime returned a publication without an exact handle.';
+    if (published.funnel) {
+      throw const TailscaleFunnelException(
+        message,
+        code: TailscaleErrorCode.publicationCommitIndeterminate,
+      );
+    }
+    throw const TailscaleServeException(
+      message,
+      code: TailscaleErrorCode.publicationCommitIndeterminate,
     );
   }
-  if (!_isLoopbackAddress(trimmed)) {
-    throw ArgumentError.value(
-      localAddress,
-      'localAddress',
-      'must be a loopback address such as 127.0.0.1, ::1, or localhost',
-    );
-  }
-  if (trimmed.toLowerCase() == 'localhost') {
-    return '127.0.0.1';
-  }
-  return trimmed;
+
+  Future<void> close() => closeFn(
+    tailnetPort: published.port,
+    path: published.path,
+    funnel: published.funnel,
+    generation: published.generation,
+    mappingToken: published.mappingToken,
+  );
+  return TailscalePublishedService._(
+    url: published.url,
+    port: published.port,
+    localAddress: published.localAddress,
+    localPort: published.localPort,
+    path: published.path,
+    https: published.https,
+    funnel: published.funnel,
+    closeFn: close,
+  );
 }
 
-bool _isLoopbackAddress(String address) {
-  if (address.toLowerCase() == 'localhost') return true;
-  return InternetAddress.tryParse(address)?.isLoopback ?? false;
+final class _PublishedServiceFinalizerToken {
+  const _PublishedServiceFinalizerToken(this.close);
+
+  final Future<void> Function() close;
 }
 
-String _normalizePath(String path) {
-  final trimmed = path.trim();
-  if (trimmed.isEmpty) return '/';
-  if (!trimmed.startsWith('/')) {
-    throw ArgumentError.value(path, 'path', 'must start with /');
-  }
-  if (trimmed.contains('?') || trimmed.contains('#')) {
-    throw ArgumentError.value(
-      path,
-      'path',
-      'must not include query or fragment',
-    );
-  }
-  if (_containsPathTraversal(trimmed)) {
-    throw ArgumentError.value(
-      path,
-      'path',
-      'must not include . or .. segments',
-    );
-  }
-  return trimmed;
-}
-
-bool _containsPathTraversal(String path) {
-  for (final segment in path.split('/')) {
-    if (segment == '.' || segment == '..') return true;
-  }
-  return false;
-}
+final _publishedServiceFinalizer = Finalizer<_PublishedServiceFinalizerToken>((
+  token,
+) {
+  // Finalizers are best-effort and cannot surface failures to a caller. Wrap
+  // both synchronous throws and asynchronous errors so an unreachable handle
+  // can never produce an unhandled isolate error.
+  Future<void>.sync(token.close).ignore();
+});

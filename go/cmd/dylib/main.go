@@ -12,7 +12,7 @@ import "C"
 
 import (
 	"encoding/json"
-	"sync/atomic"
+	"fmt"
 	"time"
 	"unsafe"
 
@@ -20,34 +20,180 @@ import (
 )
 
 //export DuneStart
-func DuneStart(hostname *C.char, authKey *C.char, controlURL *C.char, stateDir *C.char, ephemeral C.int) *C.char {
+func DuneStart(requestToken C.ulonglong, hostname *C.char, authKey *C.char, controlURL *C.char, ephemeral C.int, hostNetworkSnapshot *C.char, bootstrapBudgetMillis C.longlong) *C.char {
 	name := C.GoString(hostname)
 	key := C.GoString(authKey)
 	ctl := C.GoString(controlURL)
-	dir := C.GoString(stateDir)
+	network := C.GoString(hostNetworkSnapshot)
+	budgetMillis := int64(bootstrapBudgetMillis)
+	if budgetMillis < 0 {
+		budgetMillis = 0
+	}
+	const maxDurationMillis = int64(^uint64(0)>>1) / int64(time.Millisecond)
+	if budgetMillis > maxDurationMillis {
+		budgetMillis = maxDurationMillis
+	}
 
-	err := tailscale.Start(name, key, ctl, dir, ephemeral != 0)
+	alreadyActive, runtimeToken, err := tailscale.StartRuntimeWithBootstrapBudget(
+		uint64(requestToken),
+		name,
+		key,
+		ctl,
+		ephemeral != 0,
+		network,
+		time.Duration(budgetMillis)*time.Millisecond,
+	)
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return lifecycleError(err)
+	}
+	b, _ := json.Marshal(map[string]any{
+		"ok":            true,
+		"alreadyActive": alreadyActive,
+		"runtimeToken":  runtimeToken,
+	})
+	return C.CString(string(b))
+}
+
+//export DuneMarkUpSettled
+func DuneMarkUpSettled(runtimeToken C.ulonglong) {
+	tailscale.MarkRuntimeUpSettled(uint64(runtimeToken))
+}
+
+//export DuneConfigure
+func DuneConfigure(stateRoot *C.char, keybayNamespace *C.char, logLevel C.int) *C.char {
+	resolved, err := tailscale.Configure(
+		C.GoString(stateRoot),
+		C.GoString(keybayNamespace),
+		int32(logLevel),
+	)
+	if err != nil {
+		return lifecycleError(err)
+	}
+	b, _ := json.Marshal(map[string]any{"stateDir": resolved})
+	return C.CString(string(b))
+}
+
+//export DuneSetEphemeralScratchParent
+func DuneSetEphemeralScratchParent(parent *C.char) {
+	tailscale.SetEphemeralScratchParent(C.GoString(parent))
+}
+
+//export DuneBeginPersistentPreparation
+func DuneBeginPersistentPreparation(requestToken C.ulonglong) *C.char {
+	if err := tailscale.BeginPersistentPreparation(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
 	}
 	return C.CString(`{"ok":true}`)
 }
 
-//export DuneSetNetworkInterfaces
-func DuneSetNetworkInterfaces(snapshot *C.char) *C.char {
-	if err := tailscale.ConfigureHostNetworkSnapshot(C.GoString(snapshot)); err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+//export DuneInspectPersistentPreparation
+func DuneInspectPersistentPreparation(requestToken C.ulonglong) *C.char {
+	layout, err := tailscale.InspectPersistentPreparation(uint64(requestToken))
+	if err != nil {
+		return lifecycleError(err)
+	}
+	b, _ := json.Marshal(map[string]any{"layout": layout})
+	return C.CString(string(b))
+}
+
+//export DuneMarkCustodyActive
+func DuneMarkCustodyActive(requestToken C.ulonglong) *C.char {
+	if err := tailscale.MarkCustodyActive(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneMarkCustodyWriteAttempted
+func DuneMarkCustodyWriteAttempted(requestToken C.ulonglong) *C.char {
+	if err := tailscale.MarkCustodyWriteAttempted(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneResolvePersistentCustody
+func DuneResolvePersistentCustody(requestToken C.ulonglong, dekPresent C.int) *C.char {
+	action, err := tailscale.ResolvePersistentCustody(uint64(requestToken), dekPresent != 0)
+	if err != nil {
+		return lifecycleError(err)
+	}
+	b, _ := json.Marshal(map[string]any{"action": action})
+	return C.CString(string(b))
+}
+
+//export DuneSupplyPreparedDEK
+func DuneSupplyPreparedDEK(requestToken C.ulonglong, key *C.uint8_t, keyLength C.longlong) *C.char {
+	if keyLength != C.longlong(32) || key == nil {
+		err := fmt.Errorf("%w: got %d bytes, want 32", tailscale.ErrInvalidStateKey, int64(keyLength))
+		return lifecycleError(err)
+	}
+	raw := unsafe.Slice((*byte)(unsafe.Pointer(key)), 32)
+	if err := tailscale.SupplyPreparedDEK(uint64(requestToken), raw); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DunePreparePersistentState
+func DunePreparePersistentState(requestToken C.ulonglong) *C.char {
+	empty, err := tailscale.PreparePersistentState(uint64(requestToken))
+	if err != nil {
+		return lifecycleError(err)
+	}
+	b, _ := json.Marshal(map[string]any{"empty": empty})
+	return C.CString(string(b))
+}
+
+//export DuneCompletePersistentCustody
+func DuneCompletePersistentCustody(requestToken C.ulonglong) *C.char {
+	if err := tailscale.CompletePersistentCustody(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneFinishPreparedPersistentState
+func DuneFinishPreparedPersistentState(requestToken C.ulonglong) *C.char {
+	if err := tailscale.FinishPreparedPersistentState(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneBeginLocalReset
+func DuneBeginLocalReset(requestToken C.ulonglong) *C.char {
+	result, err := tailscale.BeginLocalReset(uint64(requestToken))
+	if err != nil {
+		return lifecycleErrorWithFields(err, map[string]any{
+			"token":   result.Token,
+			"stopped": result.Stopped,
+		})
+	}
+	b, _ := json.Marshal(result)
+	return C.CString(string(b))
+}
+
+//export DuneFinishLocalReset
+func DuneFinishLocalReset(requestToken C.ulonglong, custodyDeletionSucceeded C.int) *C.char {
+	if err := tailscale.FinishLocalReset(uint64(requestToken), custodyDeletionSucceeded != 0); err != nil {
+		return lifecycleError(err)
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneFinishCustody
+func DuneFinishCustody(requestToken C.ulonglong, cleanupSucceeded C.int) *C.char {
+	if err := tailscale.FinishCustody(uint64(requestToken), cleanupSucceeded != 0); err != nil {
+		return lifecycleError(err)
 	}
 	return C.CString(`{"ok":true}`)
 }
 
 //export DuneHttpStart
-func DuneHttpStart(method *C.char, url *C.char, headersJSON *C.char, contentLength C.longlong, followRedirects C.int, maxRedirects C.int) *C.char {
+func DuneHttpStart(runtimeToken C.ulonglong, method *C.char, url *C.char, headersJSON *C.char, contentLength C.longlong, followRedirects C.int, maxRedirects C.int) *C.char {
 	req, err := tailscale.HttpStart(
+		uint64(runtimeToken),
 		C.GoString(method),
 		C.GoString(url),
 		C.GoString(headersJSON),
@@ -56,9 +202,7 @@ func DuneHttpStart(method *C.char, url *C.char, headersJSON *C.char, contentLeng
 		int(maxRedirects),
 	)
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return C.CString(tailscale.ErrorJSON(err))
 	}
 	result, _ := json.Marshal(map[string]any{
 		"requestBodyFd":  req.RequestBodyFD,
@@ -68,12 +212,10 @@ func DuneHttpStart(method *C.char, url *C.char, headersJSON *C.char, contentLeng
 }
 
 //export DuneHttpBind
-func DuneHttpBind(tailnetPort C.int) *C.char {
-	binding, err := tailscale.HttpBind(int(tailnetPort))
+func DuneHttpBind(runtimeToken C.ulonglong, tailnetPort C.int) *C.char {
+	binding, err := tailscale.HttpBind(uint64(runtimeToken), int(tailnetPort))
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return C.CString(tailscale.ErrorJSON(err))
 	}
 	result, _ := json.Marshal(map[string]any{
 		"bindingId":      binding.ID,
@@ -122,18 +264,16 @@ func DuneHttpCloseBinding(bindingID C.longlong) {
 }
 
 //export DuneTcpDialFd
-func DuneTcpDialFd(host *C.char, port C.int, timeoutMillis C.longlong) *C.char {
+func DuneTcpDialFd(runtimeToken C.ulonglong, host *C.char, port C.int, timeoutMillis C.longlong) *C.char {
 	h := C.GoString(host)
 	var timeout time.Duration
 	if timeoutMillis > 0 {
 		timeout = time.Duration(timeoutMillis) * time.Millisecond
 	}
 
-	conn, err := tailscale.TcpDialFd(h, int(port), timeout)
+	conn, err := tailscale.TcpDialFd(uint64(runtimeToken), h, int(port), timeout)
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return C.CString(tailscale.ErrorJSON(err))
 	}
 	result, _ := json.Marshal(map[string]any{
 		"fd":            conn.FD,
@@ -146,13 +286,11 @@ func DuneTcpDialFd(host *C.char, port C.int, timeoutMillis C.longlong) *C.char {
 }
 
 //export DuneTcpListenFd
-func DuneTcpListenFd(tailnetPort C.int, tailnetHost *C.char) *C.char {
+func DuneTcpListenFd(runtimeToken C.ulonglong, tailnetPort C.int, tailnetHost *C.char) *C.char {
 	host := C.GoString(tailnetHost)
-	listener, err := tailscale.TcpListenFd(int(tailnetPort), host)
+	listener, err := tailscale.TcpListenFd(uint64(runtimeToken), int(tailnetPort), host)
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return C.CString(tailscale.ErrorJSON(err))
 	}
 	result, _ := json.Marshal(map[string]any{
 		"listenerId":   listener.ID,
@@ -163,9 +301,9 @@ func DuneTcpListenFd(tailnetPort C.int, tailnetHost *C.char) *C.char {
 }
 
 //export DuneTlsListenFd
-func DuneTlsListenFd(tailnetPort C.int, tailnetHost *C.char) *C.char {
+func DuneTlsListenFd(runtimeToken C.ulonglong, tailnetPort C.int, tailnetHost *C.char) *C.char {
 	host := C.GoString(tailnetHost)
-	listener, err := tailscale.TlsListenFd(int(tailnetPort), host)
+	listener, err := tailscale.TlsListenFd(uint64(runtimeToken), int(tailnetPort), host)
 	if err != nil {
 		return C.CString(tailscale.ErrorJSON(err))
 	}
@@ -208,20 +346,24 @@ func DuneTcpCloseFdListener(listenerID C.longlong) {
 }
 
 //export DuneUdpBindFd
-func DuneUdpBindFd(host *C.char, port C.int) *C.char {
+func DuneUdpBindFd(runtimeToken C.ulonglong, host *C.char, port C.int) *C.char {
 	h := C.GoString(host)
-	binding, err := tailscale.UdpBindFd(h, int(port))
+	binding, err := tailscale.UdpBindFd(uint64(runtimeToken), h, int(port))
 	if err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+		return C.CString(tailscale.ErrorJSON(err))
 	}
 	result, _ := json.Marshal(map[string]any{
 		"fd":           binding.FD,
+		"bindingId":    binding.BindingID,
 		"localAddress": binding.LocalAddress,
 		"localPort":    binding.LocalPort,
 	})
 	return C.CString(string(result))
+}
+
+//export DuneUdpCloseBinding
+func DuneUdpCloseBinding(bindingID C.longlong) {
+	tailscale.UdpCloseBinding(int64(bindingID))
 }
 
 //export DuneReactorCreate
@@ -308,8 +450,9 @@ func DuneTlsDomains() *C.char {
 }
 
 //export DuneDiagPing
-func DuneDiagPing(ip *C.char, timeoutMillis C.int, pingType *C.char) *C.char {
+func DuneDiagPing(runtimeToken C.ulonglong, ip *C.char, timeoutMillis C.int, pingType *C.char) *C.char {
 	return C.CString(tailscale.DiagPing(
+		uint64(runtimeToken),
 		C.GoString(ip),
 		int(timeoutMillis),
 		C.GoString(pingType),
@@ -319,6 +462,11 @@ func DuneDiagPing(ip *C.char, timeoutMillis C.int, pingType *C.char) *C.char {
 //export DuneDiagMetrics
 func DuneDiagMetrics() *C.char {
 	return C.CString(tailscale.DiagMetrics())
+}
+
+//export DuneDebugNodeState
+func DuneDebugNodeState() *C.char {
+	return C.CString(tailscale.DebugNodeState())
 }
 
 //export DuneDiagDERPMap
@@ -331,29 +479,98 @@ func DuneDiagCheckUpdate() *C.char {
 	return C.CString(tailscale.DiagCheckUpdate())
 }
 
-//export DuneHasState
-func DuneHasState(stateDir *C.char) C.int {
-	dir := C.GoString(stateDir)
-	if tailscale.HasState(dir) {
-		return 1
+//export DuneLogout
+func DuneLogout(requestToken C.ulonglong, hostNetworkSnapshot *C.char) *C.char {
+	result, err := tailscale.LogoutWithToken(uint64(requestToken), C.GoString(hostNetworkSnapshot))
+	if err != nil {
+		return lifecycleErrorWithFields(err, logoutDisposition(result))
 	}
-	return 0
+	b, _ := json.Marshal(result)
+	return C.CString(string(b))
 }
 
-//export DuneLogout
-func DuneLogout(stateDir *C.char) *C.char {
-	dir := C.GoString(stateDir)
-	if err := tailscale.Logout(dir); err != nil {
-		m := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(m)
-		return C.CString(string(b))
+//export DuneAbandon
+func DuneAbandon(requestToken C.ulonglong) *C.char {
+	result, err := tailscale.AbandonRuntime(uint64(requestToken))
+	if err != nil {
+		return lifecycleErrorWithFields(err, runtimeCloseDisposition(result))
+	}
+	b, _ := json.Marshal(result)
+	return C.CString(string(b))
+}
+
+//export DuneAwaitRuntimeQuiescence
+func DuneAwaitRuntimeQuiescence(requestToken C.ulonglong) *C.char {
+	if err := tailscale.AwaitRuntimeQuiescence(uint64(requestToken)); err != nil {
+		return lifecycleError(err)
 	}
 	return C.CString(`{"ok":true}`)
 }
 
+//export DuneRetireAbandonedRuntimeToken
+func DuneRetireAbandonedRuntimeToken(requestToken C.ulonglong) *C.char {
+	tailscale.RetireAbandonedRuntimeToken(uint64(requestToken))
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneAcknowledgeLifecycle
+func DuneAcknowledgeLifecycle(requestToken C.ulonglong) {
+	tailscale.AcknowledgeLifecycleResult(uint64(requestToken))
+}
+
+func lifecycleError(err error) *C.char {
+	return lifecycleErrorWithFields(err, nil)
+}
+
+func lifecycleErrorWithFields(err error, fields map[string]any) *C.char {
+	return C.CString(lifecycleErrorJSON(err, fields))
+}
+
+func lifecycleErrorJSON(err error, fields map[string]any) string {
+	m := map[string]any{"error": err.Error()}
+	for key, value := range fields {
+		m[key] = value
+	}
+	if code := tailscale.LifecycleErrorCode(err); code != "" {
+		m["code"] = code
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
+func logoutDisposition(result tailscale.LogoutResult) map[string]any {
+	return map[string]any{
+		"token":         result.Token,
+		"started":       result.Started,
+		"emitStopped":   result.EmitStopped,
+		"noState":       result.NoState,
+		"cleanupFailed": result.CleanupFailed,
+	}
+}
+
+func runtimeCloseDisposition(result tailscale.RuntimeCloseResult) map[string]any {
+	return map[string]any{
+		"token":              result.Token,
+		"operation":          result.Operation,
+		"matched":            result.Matched,
+		"started":            result.Started,
+		"emitStopped":        result.EmitStopped,
+		"pending":            result.Pending,
+		"noState":            result.NoState,
+		"cleanupFailed":      result.CleanupFailed,
+		"custodyHeld":        result.CustodyHeld,
+		"custodyDisposition": result.CustodyDisposition,
+	}
+}
+
 //export DuneStop
-func DuneStop() {
-	tailscale.Stop()
+func DuneStop(requestToken C.ulonglong) *C.char {
+	result, err := tailscale.CloseRuntime(uint64(requestToken))
+	if err != nil {
+		return lifecycleErrorWithFields(err, runtimeCloseDisposition(result))
+	}
+	b, _ := json.Marshal(result)
+	return C.CString(string(b))
 }
 
 //export DuneStatus
@@ -387,8 +604,24 @@ func DuneExitNodeUseAuto() *C.char {
 }
 
 //export DuneServeForward
-func DuneServeForward(payloadJSON *C.char) *C.char {
-	return C.CString(tailscale.ServeForward(C.GoString(payloadJSON)))
+func DuneServeForward(runtimeToken C.ulonglong, payloadJSON *C.char) *C.char {
+	return C.CString(tailscale.ServeForward(uint64(runtimeToken), C.GoString(payloadJSON)))
+}
+
+//export DuneAcknowledgePublication
+func DuneAcknowledgePublication(runtimeToken, generation, mappingToken C.ulonglong) *C.char {
+	if err := tailscale.AcknowledgePublication(uint64(runtimeToken), uint64(generation), uint64(mappingToken)); err != nil {
+		return C.CString(tailscale.ErrorJSON(err))
+	}
+	return C.CString(`{"ok":true}`)
+}
+
+//export DuneFailPublicationDelivery
+func DuneFailPublicationDelivery(runtimeToken C.ulonglong) *C.char {
+	if err := tailscale.FailPublicationDelivery(uint64(runtimeToken)); err != nil {
+		return C.CString(tailscale.ErrorJSON(err))
+	}
+	return C.CString(`{"ok":true}`)
 }
 
 //export DuneServeClear
@@ -399,11 +632,6 @@ func DuneServeClear(payloadJSON *C.char) *C.char {
 //export DuneFree
 func DuneFree(ptr *C.char) {
 	C.free(unsafe.Pointer(ptr))
-}
-
-//export DuneSetLogLevel
-func DuneSetLogLevel(level C.int) {
-	atomic.StoreInt32(&tailscale.LogLevel, int32(level))
 }
 
 //export DuneInitDartAPI

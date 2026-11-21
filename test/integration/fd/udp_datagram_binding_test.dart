@@ -7,8 +7,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:tailscale/src/api/udp.dart';
-import 'package:tailscale/src/ffi_bindings.dart' as native;
 import 'package:tailscale/tailscale.dart';
+
+import '../support/process_state_root.dart';
 import 'package:test/test.dart';
 
 import '../support/posix_fd_test_support.dart';
@@ -65,7 +66,9 @@ void main() {
             List<int>.filled(tailscaleMaxDatagramPayloadBytes + 1, 1),
             to: const TailscaleEndpoint(address: '100.64.0.2', port: 7001),
           ),
-          throwsA(isA<TailscaleUdpException>()),
+          // Caller-argument validation now throws ArgumentError (consistent
+          // with serve/funnel/http), not TailscaleUdpException.
+          throwsA(isA<ArgumentError>()),
         );
       });
 
@@ -82,6 +85,7 @@ void main() {
         final (:leftFd, :rightFd) = _socketPair();
         final binding = await createFdTailscaleDatagramBinding(
           fd: leftFd,
+          bindingId: 1,
           local: const TailscaleEndpoint(address: '100.64.0.1', port: 7001),
         );
         addTearDown(() async {
@@ -109,6 +113,35 @@ void main() {
         );
         expect(error, isA<TailscaleUdpException>());
       });
+
+      test('close signals the Go-side bridge with the binding id', () async {
+        // Regression for the UDP leak: closing a binding must tell Go to tear
+        // down its bridge (a datagram peer-close won't wake the Go reader),
+        // keyed by the opaque binding id — never the fd, whose OS number the
+        // kernel reuses.
+        final (:leftFd, :rightFd) = _socketPair();
+        const bindingId = 41;
+        final closedIds = <int>[];
+        final binding = await createFdTailscaleDatagramBinding(
+          fd: leftFd,
+          bindingId: bindingId,
+          local: const TailscaleEndpoint(address: '100.64.0.1', port: 7001),
+          closeFn: (id) async => closedIds.add(id),
+        );
+        addTearDown(() => TestPosixBindings.instance.close(rightFd));
+
+        await binding.close();
+
+        expect(
+          closedIds,
+          <int>[bindingId],
+          reason: 'Go-side close must run once, keyed by the binding id',
+        );
+
+        // Idempotent: a second close does not re-signal Go.
+        await binding.close();
+        expect(closedIds, <int>[bindingId]);
+      });
     },
   );
 
@@ -116,21 +149,16 @@ void main() {
     late Directory configuredStateBaseDir;
 
     setUpAll(() {
-      native.duneSetLogLevel(0);
-      configuredStateBaseDir = Directory.systemTemp.createTempSync(
-        'tailscale_udp_',
+      configuredStateBaseDir = processIntegrationStateRoot();
+      clearProcessIntegrationState(configuredStateBaseDir);
+      Tailscale.init(
+        stateDir: configuredStateBaseDir.path,
+        appId: processIntegrationAppId,
       );
-      Tailscale.init(stateDir: configuredStateBaseDir.path);
     });
 
     tearDownAll(() async {
-      try {
-        await Tailscale.instance.down();
-      } catch (_) {}
-      native.duneStop();
-      if (configuredStateBaseDir.existsSync()) {
-        configuredStateBaseDir.deleteSync(recursive: true);
-      }
+      await forgetProcessIntegrationState(configuredStateBaseDir);
     });
 
     test('throws TailscaleUdpException', () async {
@@ -150,11 +178,13 @@ _bindingPair() async {
   final (:leftFd, :rightFd) = _socketPair();
   final left = await createFdTailscaleDatagramBinding(
     fd: leftFd,
+    bindingId: 11,
     local: const TailscaleEndpoint(address: '100.64.0.1', port: 7001),
   );
   try {
     final right = await createFdTailscaleDatagramBinding(
       fd: rightFd,
+      bindingId: 12,
       local: const TailscaleEndpoint(address: '100.64.0.2', port: 7001),
     );
     return (left: left, right: right);

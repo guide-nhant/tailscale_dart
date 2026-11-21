@@ -8,7 +8,8 @@ import 'dart:isolate';
 
 import 'package:test/test.dart';
 import 'package:tailscale/tailscale.dart';
-import 'package:tailscale/src/ffi_bindings.dart' as native;
+
+import '../support/process_state_root.dart';
 
 /// Spawned isolate body: echoes the identity it receives back to [reply],
 /// mirroring how the TCP accept loop hands a decoded identity to its parent.
@@ -132,19 +133,13 @@ void main() {
     late Directory stateDir;
 
     setUpAll(() {
-      native.duneSetLogLevel(0);
-      stateDir = Directory.systemTemp.createTempSync('tailscale_whois_');
-      Tailscale.init(stateDir: stateDir.path);
+      stateDir = processIntegrationStateRoot();
+      clearProcessIntegrationState(stateDir);
+      Tailscale.init(stateDir: stateDir.path, appId: processIntegrationAppId);
     });
 
     tearDownAll(() async {
-      try {
-        await Tailscale.instance.down();
-      } catch (_) {}
-      native.duneStop();
-      if (stateDir.existsSync()) {
-        stateDir.deleteSync(recursive: true);
-      }
+      await forgetProcessIntegrationState(stateDir);
     });
 
     test('rejects obviously-invalid IPs', () async {
@@ -157,7 +152,13 @@ void main() {
     test('before up() throws', () async {
       await expectLater(
         Tailscale.instance.whois('100.64.0.5'),
-        throwsA(isA<TailscaleException>()),
+        throwsA(
+          isA<TailscaleStatusException>().having(
+            (error) => error.code,
+            'code',
+            TailscaleErrorCode.staleRuntime,
+          ),
+        ),
       );
     });
   });
