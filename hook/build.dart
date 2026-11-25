@@ -35,6 +35,38 @@ void main(List<String> args) async {
     }
 
     final targetOS = input.config.code.targetOS;
+
+    // Optional allow-list of target OSes, set by the consuming app:
+    //
+    //   hooks:
+    //     user_defines:
+    //       tailscale:
+    //         build_targets: [ios, android]
+    //
+    // When set and the current target is not listed, skip the Go build and
+    // register no code asset. An app that only uses tsnet on some platforms
+    // (e.g. LumeN: iOS in-process tsnet, desktop uses the OS Tailscale
+    // daemon) then needs no Go toolchain to build the other platforms. The
+    // app must not call into the package on a skipped platform — the @Native
+    // lookups would fail at call time. Unset = build for every target.
+    final buildTargets = input.userDefines['build_targets'];
+    if (buildTargets != null) {
+      if (buildTargets is! List || buildTargets.any((t) => t is! String)) {
+        throw const FormatException(
+          'hooks.user_defines.tailscale.build_targets must be a list of OS '
+          'names, e.g. [ios, android] (one of: android, ios, linux, macos, '
+          'windows).',
+        );
+      }
+      final allowed = buildTargets
+          .cast<String>()
+          .map((t) => t.trim().toLowerCase())
+          .toSet();
+      if (!allowed.contains(targetOS.name)) {
+        return;
+      }
+    }
+
     final targetArch = input.config.code.targetArchitecture;
     final packageRoot = input.packageRoot.toFilePath();
     final outDir = input.outputDirectory;
