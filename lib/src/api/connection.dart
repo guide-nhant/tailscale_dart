@@ -57,6 +57,11 @@ final class TailscaleEndpoint {
 /// [TailscaleConnection] / [TailscaleDatagramBinding] wrapper. The caller
 /// MUST `close(fd)` when done.
 ///
+/// For [Udp.bindFd] the Go side also keeps a bridge (bound tailnet port plus
+/// two pump goroutines) that a datagram peer-close does not wake. The caller
+/// MUST also pass [bindingId] to [Udp.closeFdBinding] when done, or that
+/// bridge leaks until the node stops.
+///
 /// The fd carries WireGuard-tunneled traffic transparently: reads and
 /// writes flow over the tailnet to the remote endpoint just as they would
 /// with a native socket. It is safe to use with standard POSIX socket calls
@@ -64,7 +69,12 @@ final class TailscaleEndpoint {
 /// supported today — matching the rest of the package.
 @immutable
 final class TailscaleFdEndpoint {
-  const TailscaleFdEndpoint({required this.fd, required this.local, this.remote});
+  const TailscaleFdEndpoint({
+    required this.fd,
+    required this.local,
+    this.remote,
+    this.bindingId,
+  });
 
   /// POSIX file descriptor. Caller owns; must `close()` when done.
   final int fd;
@@ -76,20 +86,27 @@ final class TailscaleFdEndpoint {
   /// carry per-packet remote endpoints in the wire envelope, not on the fd.
   final TailscaleEndpoint? remote;
 
+  /// Opaque Go-side bridge id for [Udp.bindFd] endpoints; pass it to
+  /// [Udp.closeFdBinding] when done. Null for [Tcp.dialFd] (a TCP stream
+  /// bridge ends when the fd is closed).
+  final int? bindingId;
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is TailscaleFdEndpoint &&
           fd == other.fd &&
           local == other.local &&
-          remote == other.remote;
+          remote == other.remote &&
+          bindingId == other.bindingId;
 
   @override
-  int get hashCode => Object.hash(fd, local, remote);
+  int get hashCode => Object.hash(fd, local, remote, bindingId);
 
   @override
   String toString() =>
-      'TailscaleFdEndpoint(fd: $fd, local: $local, remote: $remote)';
+      'TailscaleFdEndpoint(fd: $fd, local: $local, remote: $remote, '
+      'bindingId: $bindingId)';
 }
 
 /// One full-duplex byte stream over the tailnet.

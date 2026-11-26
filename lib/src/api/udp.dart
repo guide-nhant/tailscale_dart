@@ -129,6 +129,15 @@ abstract class Udp {
   /// [bind] and the wrapped [TailscaleDatagramBinding.send] / .datagrams
   /// instead.
   Future<TailscaleFdEndpoint> bindFd({required int port, String? address});
+
+  /// Tears down the Go-side bridge of a [bindFd] endpoint: closes the tailnet
+  /// packet listener (frees the port) and stops its pump goroutines.
+  ///
+  /// [bindingId] is [TailscaleFdEndpoint.bindingId]. Call it once the native
+  /// owner has stopped using the fd (closing the fd alone does not wake the
+  /// bridge). Closing the fd stays the caller's job; the order does not
+  /// matter. Unknown or already-closed ids are a no-op.
+  Future<void> closeFdBinding(int bindingId);
 }
 
 /// Library-internal factory. Reach via `Tailscale.instance.udp`.
@@ -216,18 +225,28 @@ final class _Udp implements Udp {
     final resolvedAddress = address ?? '';
     try {
       // fd ownership transfers to the caller (see TailscaleFdEndpoint); the
-      // runtime does not adopt the fd into a datagram-binding wrapper. NB:
-      // `_bind` still allocates a Go-side bridge keyed by `bindingId`, and per
-      // UdpCloseFn a datagram socketpair peer-close does NOT wake that bridge —
-      // so closing the fd alone leaks the Go port/goroutines until the node
-      // stops. A leak-free raw UDP fd needs TailscaleFdEndpoint to carry the
-      // bindingId (or a detached-fd Go path); left to the maintainer.
-      final (:fd, :local, bindingId: _) = await _bind(resolvedAddress, port);
-      return TailscaleFdEndpoint(fd: fd, local: local);
+      // runtime does not adopt the fd into a datagram-binding wrapper. `_bind`
+      // still allocates a Go-side bridge keyed by `bindingId`, and per
+      // UdpCloseFn a datagram socketpair peer-close does NOT wake it, so the
+      // id goes back to the caller for [closeFdBinding].
+      final (:fd, :local, :bindingId) = await _bind(resolvedAddress, port);
+      return TailscaleFdEndpoint(fd: fd, local: local, bindingId: bindingId);
     } catch (e) {
       if (e is TailscaleUdpException) rethrow;
       throw TailscaleUdpException(
         'udp.bindFd failed for $resolvedAddress:$port',
+        cause: e,
+      );
+    }
+  }
+
+  @override
+  Future<void> closeFdBinding(int bindingId) async {
+    try {
+      await _close(bindingId);
+    } catch (e) {
+      throw TailscaleUdpException(
+        'udp.closeFdBinding failed for binding $bindingId',
         cause: e,
       );
     }
